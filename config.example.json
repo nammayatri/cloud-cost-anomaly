@@ -1,12 +1,18 @@
 {
-  "aws_profile": "uat",
+  "provider": "aws",
+
+  "aws_profile": "prod",
   "aws_region": "ap-south-1",
-  "slack_bot_token": "xoxb-REPLACE-ME",
-  "slack_channel_id": "C0XXXXXXX",
-  "increase_pct_threshold": 10,
+
+  "gcp_billing_table": "my-project.billing_dataset.gcp_billing_export_resource_v1_XXXXXX",
+  "gcp_project": "my-gcp-project",
+  "gcp_projects": ["project-a", "project-b"],
+
+  "slack_bot_token": "xoxb-...",
+  "slack_channel_id": "C0XXXXXXXXX",
+  "mention": "",
+  "increase_pct_threshold": 8,
   "decrease_pct_threshold": 5,
-  "abs_threshold": 1,
-  "noise_floor": 1,
   "lookback_days": 21,
   "top_usage_types": 3
 }
