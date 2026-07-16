@@ -45,14 +45,23 @@ def detect(df: pd.DataFrame, target: date, cfg: dict) -> tuple[list[Anomaly], li
     prev = target - timedelta(days=1)
     last_week = target - timedelta(days=7)
 
+    # Distinguish "the whole baseline day is missing from the data" from "this
+    # service simply had no spend on a day that IS present". The former must NOT
+    # manufacture an infinite spike (a delayed billing export would otherwise flag
+    # every service); we treat a missing baseline DAY as flat (== today). The
+    # latter is a real zero — a genuinely new service (day present, value 0) still
+    # correctly shows as an increase.
+    prev_present = prev in df.index
+    lw_present = last_week in df.index
+
     increases: list[Anomaly] = []
     decreases: list[Anomaly] = []
     for svc in df.columns:
         if svc == "Total":
             continue
         today_v = float(df.at[target, svc])
-        prev_v = float(df.at[prev, svc]) if prev in df.index else 0.0
-        lw_v = float(df.at[last_week, svc]) if last_week in df.index else 0.0
+        prev_v = float(df.at[prev, svc]) if prev_present else today_v
+        lw_v = float(df.at[last_week, svc]) if lw_present else today_v
 
         # Noise floor on the larger of the values — otherwise we'd miss a service
         # that went from $100 to $0 (today_v < floor).
@@ -107,9 +116,14 @@ def detect(df: pd.DataFrame, target: date, cfg: dict) -> tuple[list[Anomaly], li
     increases.sort(key=lambda a: a.abs_delta, reverse=True)
     decreases.sort(key=lambda a: a.abs_delta, reverse=True)
 
-    total_today = float(df.at[target, "Total"]) if "Total" in df.columns else float(df.loc[target].sum())
-    total_prev = float(df.at[prev, "Total"]) if "Total" in df.columns and prev in df.index else 0.0
-    total_lw = float(df.at[last_week, "Total"]) if "Total" in df.columns and last_week in df.index else 0.0
+    def _total(day: date) -> float:
+        return float(df.at[day, "Total"]) if "Total" in df.columns else float(df.loc[day].sum())
+
+    total_today = _total(target)
+    # Same missing-baseline-day guard as the per-service loop: a whole absent day
+    # is treated as flat (== today), never as $0 -> infinite total spike.
+    total_prev = _total(prev) if prev_present else total_today
+    total_lw = _total(last_week) if lw_present else total_today
     summary = {
         "date": target,
         "total": total_today,

@@ -1,15 +1,16 @@
 from datetime import date, timedelta
 
-import pandas as pd
 
-from fetch import fetch_usage_types
-
-
-def top_movers(cfg: dict, service: str, target: date, top_n: int | None = None) -> list[dict]:
+def top_movers(cfg: dict, provider, scope: str, service: str, target: date, top_n: int | None = None) -> list[dict]:
     """For a flagged service, return the top N usage_types by max(|DoD|,|WoW|) abs delta.
-    Each mover carries both $ change AND usage-quantity change with its unit (GB/Hrs/Requests/etc)."""
+
+    Each mover carries both the cost change AND the usage-quantity change with its
+    unit (GB/Hrs/Requests/etc). `scope` is the account (AWS) or the project (GCP).
+    """
     top_n = top_n or cfg["top_usage_types"]
-    cost_df, qty_df, units = fetch_usage_types(cfg, service, end=target + timedelta(days=1), days=8)
+    cost_df, qty_df, units = provider.fetch_usage_types(
+        cfg, scope, service, end=target + timedelta(days=1), days=8
+    )
     if cost_df.empty or target not in cost_df.index:
         return []
 

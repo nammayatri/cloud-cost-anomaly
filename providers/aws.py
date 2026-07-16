@@ -1,7 +1,23 @@
+"""AWS cost provider — Cost Explorer (ce:GetCostAndUsage).
+
+Cost Explorer is already scoped to the credentialed account, so there is exactly
+one scope. The scope name is cosmetic (it only labels the Slack section).
+"""
+
 from datetime import date, timedelta
 
 import boto3
 import pandas as pd
+
+_SCOPE = "AWS"
+
+
+def scopes(cfg: dict) -> list[str]:
+    return [_SCOPE]
+
+
+def currency(cfg: dict) -> str:
+    return "USD"
 
 
 def _client(cfg: dict):
@@ -26,11 +42,8 @@ def _paginate(ce, **kwargs):
     return pages
 
 
-def fetch_by_service(cfg: dict, end: date | None = None) -> pd.DataFrame:
-    """Daily UnblendedCost grouped by SERVICE for the trailing lookback_days, ending at `end` (exclusive).
-
-    Returns a DataFrame indexed by date with one column per service, plus 'Total'.
-    """
+def fetch_by_service(cfg: dict, end: date | None = None) -> dict[str, pd.DataFrame]:
+    """Daily UnblendedCost grouped by SERVICE for the trailing lookback_days, ending at `end` (exclusive)."""
     end = end or date.today()
     start = end - timedelta(days=cfg["lookback_days"])
 
@@ -53,21 +66,21 @@ def fetch_by_service(cfg: dict, end: date | None = None) -> pd.DataFrame:
                 rows.append((d, svc, amt))
 
     if not rows:
-        return pd.DataFrame()
+        return {}
 
     df = pd.DataFrame(rows, columns=["date", "service", "cost"])
     pivot = df.pivot_table(index="date", columns="service", values="cost", aggfunc="sum").fillna(0.0)
     pivot.index = pd.to_datetime(pivot.index).date
     pivot = pivot.sort_index()
     pivot["Total"] = pivot.sum(axis=1)
-    return pivot
+    return {_SCOPE: pivot}
 
 
-def fetch_usage_types(cfg: dict, service: str, end: date | None = None, days: int = 8):
+def fetch_usage_types(cfg: dict, scope: str, service: str, end: date | None = None, days: int = 8):
     """Daily cost+quantity by USAGE_TYPE for a single service.
 
+    `scope` is accepted for interface parity and ignored — CE is single-account.
     Returns (cost_df, qty_df, unit_by_usage_type).
-    qty values are in the unit reported by AWS (e.g. GB, Hrs, Requests).
     """
     end = end or date.today()
     start = end - timedelta(days=days)
@@ -111,8 +124,8 @@ def fetch_usage_types(cfg: dict, service: str, end: date | None = None, days: in
     return cost_df.sort_index(), qty_df.sort_index(), unit_by_ut
 
 
-def load_csv(path: str) -> pd.DataFrame:
-    """Backtest helper: read the reference cost CSV into the same shape as fetch_by_service."""
+def load_csv(path: str) -> dict[str, pd.DataFrame]:
+    """Backtest helper: read a Cost Explorer CSV export into the same shape as fetch_by_service."""
     raw = pd.read_csv(path)
     raw = raw[raw["Service"].str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)].copy()
     raw["date"] = pd.to_datetime(raw["Service"]).dt.date
@@ -120,4 +133,4 @@ def load_csv(path: str) -> pd.DataFrame:
     raw.columns = [c.replace("($)", "").strip() for c in raw.columns]
     if "Total costs" in raw.columns:
         raw = raw.rename(columns={"Total costs": "Total"})
-    return raw.apply(pd.to_numeric, errors="coerce").fillna(0.0).sort_index()
+    return {_SCOPE: raw.apply(pd.to_numeric, errors="coerce").fillna(0.0).sort_index()}

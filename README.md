@@ -1,17 +1,17 @@
 <div align="center">
 
-# AWS Cost Anomaly Cron
+# Cloud Cost Anomaly Cron
 
-**Daily AWS cost anomaly detection — straight to Slack.**
+**Daily cloud cost anomaly detection — straight to Slack. AWS and GCP.**
 
-A small, opinionated Kubernetes CronJob that watches your AWS bill day by day, surfaces the services that moved meaningfully, drills down to the exact usage type responsible — and stays silent when nothing's wrong.
+A small, opinionated Kubernetes CronJob that watches your cloud bill day by day, surfaces the services that moved meaningfully, drills down to the exact usage type (AWS) or SKU (GCP) responsible — and stays silent when nothing's wrong. One `--provider` flag switches between AWS Cost Explorer and the GCP BigQuery billing export; the detection and Slack formatting are shared.
 
 <br/>
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.12-blue.svg)
 ![Platform](https://img.shields.io/badge/runs%20on-Kubernetes-326ce5.svg)
-![IAM](https://img.shields.io/badge/IAM-ce%3AGetCostAndUsage-orange.svg)
+![Clouds](https://img.shields.io/badge/clouds-AWS%20%7C%20GCP-232f3e.svg)
 ![Slack](https://img.shields.io/badge/output-Slack-4A154B.svg)
 
 <br/>
@@ -93,15 +93,20 @@ All settings can come from **either** environment variables **or** `config.json`
 
 | Key (json) | Env var | Default | Notes |
 |---|---|---|---|
+| `provider` | `PROVIDER` | `aws` | `aws` or `gcp`. Also settable with `--provider`. |
 | `slack_bot_token` | `SLACK_BOT_TOKEN` | — | **Required.** `xoxb-…` with `chat:write` |
 | `slack_channel_id` | `SLACK_CHANNEL_ID` | — | **Required.** Prefer ID over `#name` (renames don't break things) |
-| `aws_profile` | `AWS_PROFILE` | — | Local only; IRSA/WI is used in-cluster |
-| `aws_region` | `AWS_REGION` | `ap-south-1` | Region for the Cost Explorer client |
+| `aws_profile` | `AWS_PROFILE` | — | AWS only, local only; IRSA is used in-cluster |
+| `aws_region` | `AWS_REGION` | `ap-south-1` | AWS only. Region for the Cost Explorer client |
+| `gcp_billing_table` | `GCP_BILLING_TABLE` | — | GCP only, **required.** `project.dataset.table` of the BigQuery billing export |
+| `gcp_project` | `GCP_PROJECT` | — | GCP only. Project that runs/bills the BigQuery job (defaults to ADC's) |
+| `gcp_projects` | `GCP_PROJECTS` | — | GCP only, **required.** Comma-separated projects to report on, in order. The export is billing-account-wide, so this scopes it. |
+| `currency` | `CURRENCY` | `USD`/`INR` | Display currency. Defaults from provider (AWS→USD, GCP→billing currency) |
 | `mention` | `MENTION` | empty | `here`, `channel`, a user ID (`U…`), or a usergroup ID (`S…`) |
 | `increase_pct_threshold` | `INCREASE_PCT_THRESHOLD` | `10` | Up-spike threshold (percent) |
 | `decrease_pct_threshold` | `DECREASE_PCT_THRESHOLD` | `10` | Down-drop threshold (percent) |
-| `abs_threshold` | `ABS_THRESHOLD` | `1` | Absolute-dollar guard so pennies don't fire |
-| `noise_floor` | `NOISE_FLOOR` | `1` | Skip services entirely below this |
+| `abs_threshold` | `ABS_THRESHOLD` | `1` (USD) / `100` (INR) | Absolute-money guard so pennies don't fire (in the reporting currency) |
+| `noise_floor` | `NOISE_FLOOR` | `1` (USD) / `100` (INR) | Skip services entirely below this |
 | `lookback_days` | `LOOKBACK_DAYS` | `21` | Days of history to pull (≥ 8) |
 | `top_usage_types` | `TOP_USAGE_TYPES` | `3` | How many drill-down lines per service |
 
@@ -123,6 +128,31 @@ Minimal — read-only.
 Cost Explorer doesn't support resource-level ARNs, so `"Resource": "*"` is unavoidable — but the verb is read-only and only billing data leaves AWS.
 
 > Already running a monitoring/observability service with `ce:*` access? Reuse its service account — `serviceAccountName: <yours>` and you're done.
+
+**GCP** — read-only too. A dedicated service account needs exactly two grants:
+
+- `roles/bigquery.jobUser` on the project that runs the query (to submit BigQuery jobs)
+- `READER` on the billing-export **dataset** (least-privilege — not the whole project)
+
+```bash
+gcloud iam service-accounts create cost-anomaly-cron --project=<PROJECT>
+gcloud projects add-iam-policy-binding <PROJECT> \
+  --member="serviceAccount:cost-anomaly-cron@<PROJECT>.iam.gserviceaccount.com" \
+  --role="roles/bigquery.jobUser"
+# grant dataset READER via the dataset ACL (bq update --source), or a
+# roles/bigquery.dataViewer binding on the dataset
+```
+
+In-cluster, bind it to the Kubernetes SA with **Workload Identity** (no keys):
+
+```bash
+gcloud iam service-accounts add-iam-policy-binding \
+  cost-anomaly-cron@<PROJECT>.iam.gserviceaccount.com \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:<PROJECT>.svc.id.goog[<NAMESPACE>/cost-anomaly-cron]"
+```
+
+> **Note on timing:** GCP restates billing rows for ~24–48h after the usage day. Schedule the GCP run late enough that yesterday's data has settled (the manifest in `k8s-gcp/` uses a later slot than the AWS one). The query is partition-pruned and typically scans well under a rupee's worth of BigQuery.
 
 ## 🚢 Deploy
 
