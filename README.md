@@ -73,8 +73,8 @@ A service appears in the report only if **at least one** check trips. If neither
 ## 🚀 Quick start (local)
 
 ```bash
-git clone https://github.com/nammayatri/aws-cost-anomaly
-cd aws-cost-anomaly
+git clone https://github.com/nammayatri/cloud-cost-anomaly
+cd cloud-cost-anomaly
 
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt

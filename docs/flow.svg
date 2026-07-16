@@ -37,7 +37,7 @@
 
   <!-- Title -->
   <text x="490" y="36" text-anchor="middle" fill="#f1f5f9" font-size="18" font-weight="700" letter-spacing="0.5">
-    Daily AWS Cost Anomaly Pipeline
+    Daily Cloud Cost Anomaly Pipeline
   </text>
   <text x="490" y="56" text-anchor="middle" fill="#94a3b8" font-size="12">
     Runs once a day · stays silent unless something crosses thresholds
@@ -54,9 +54,9 @@
   <!-- Stage 2: Cost Explorer -->
   <g transform="translate(220, 130)">
     <rect width="140" height="100" rx="10" fill="url(#ceGrad)" filter="url(#glow)"/>
-    <text x="70" y="38" text-anchor="middle" fill="white" font-size="13" font-weight="600">📊 Cost Explorer</text>
-    <text x="70" y="60" text-anchor="middle" fill="#fed7aa" font-size="11">21 days · daily</text>
-    <text x="70" y="78" text-anchor="middle" fill="#fed7aa" font-size="11">group by SERVICE</text>
+    <text x="70" y="38" text-anchor="middle" fill="white" font-size="13" font-weight="600">📊 Billing Data</text>
+    <text x="70" y="60" text-anchor="middle" fill="#fed7aa" font-size="11">AWS CE · GCP BQ</text>
+    <text x="70" y="78" text-anchor="middle" fill="#fed7aa" font-size="11">21 days · by service</text>
   </g>
 
   <!-- Stage 3: Detect -->
@@ -71,8 +71,8 @@
   <g transform="translate(580, 130)">
     <rect width="140" height="100" rx="10" fill="url(#drillGrad)" filter="url(#glow)"/>
     <text x="70" y="38" text-anchor="middle" fill="white" font-size="13" font-weight="600">🔬 Drilldown</text>
-    <text x="70" y="60" text-anchor="middle" fill="#fbcfe8" font-size="11">by usage type</text>
-    <text x="70" y="78" text-anchor="middle" fill="#fbcfe8" font-size="11">+ quantity (GB/Hrs)</text>
+    <text x="70" y="60" text-anchor="middle" fill="#fbcfe8" font-size="11">usage type · SKU</text>
+    <text x="70" y="78" text-anchor="middle" fill="#fbcfe8" font-size="11">+ quantity</text>
   </g>
 
   <!-- Stage 5: Slack -->
@@ -115,7 +115,7 @@
   <!-- Decision branch indicator -->
   <g transform="translate(490, 260)">
     <text x="0" y="0" text-anchor="middle" fill="#cbd5e1" font-size="11">
-      <tspan x="0" dy="0">if &gt; 10% up  OR  &gt; 10% down  &amp; &gt; $1 abs</tspan>
+      <tspan x="0" dy="0">if past the % threshold  &amp;  over the abs money floor</tspan>
       <tspan x="0" dy="18" fill="#fbbf24">→ post to Slack</tspan>
       <tspan x="0" dy="18" fill="#94a3b8">else stay silent</tspan>
     </text>
@@ -123,6 +123,6 @@
 
   <!-- Footer hint -->
   <text x="490" y="340" text-anchor="middle" fill="#64748b" font-size="10">
-    ce:GetCostAndUsage   ·   chat:write   ·   no inputs, no state
+    AWS Cost Explorer   ·   GCP BigQuery   ·   Slack chat:write   ·   no inputs, no state
   </text>
 </svg>
