@@ -1,129 +1,30 @@
-from datetime import date as _date, timedelta as _td
+"""Slack delivery: a readable summary, then per-account tables, then the workbook.
+
+The root message answers only "how much, and is that within budget". Every
+breakdown lives in threaded replies, so the channel view stays a few lines
+regardless of how many accounts exist.
+
+Tables are rendered as monospace code blocks rather than Block Kit fields. Slack
+has no real table primitive, and a column of rupee figures is only comparable when
+the digits line up — proportional text turns a cost column into noise.
+"""
+
+import logging
 
 from slack_sdk import WebClient
 
-from detect import Anomaly
+import collect
+import money
 
-# --- currency -----------------------------------------------------------------
-# Set once per run from cfg. AWS reports USD; GCP reports the billing account's
-# currency (INR for us). Everything downstream formats through _money(), so this
-# is the only place that needs to know.
-_SYMBOLS = {"USD": "$", "INR": "₹", "EUR": "€", "GBP": "£"}
-_symbol = "$"
-# INR amounts are large and whole-rupee precision is plenty; cents matter in USD.
-_decimals = 2
+log = logging.getLogger("cost-anomaly.slack")
 
-# How to render usage quantities. AWS needs unit conversion; GCP values already
-# arrive in their billing unit. See _fmt_qty.
-_unit_style = "aws"
-
-
-def set_currency(code: str) -> None:
-    global _symbol, _decimals
-    _symbol = _SYMBOLS.get(code, code + " ")
-    _decimals = 0 if code == "INR" else 2
-
-
-def set_unit_style(provider: str) -> None:
-    global _unit_style
-    _unit_style = provider
-
-
-def _fmt_date(d: _date) -> str:
-    return d.strftime("%a %d %b")
-
-
-def _money(v: float) -> str:
-    sign = "-" if v < 0 else ""
-    return f"{sign}{_symbol}{abs(v):,.{_decimals}f}"
-
-
-def _zero() -> str:
-    return f"{_symbol}0"
-
-
-def _ymoney(v: float) -> str:
-    """Money amount for the main message (prefixed with the moneybag emoji)."""
-    return f":moneybag: {_money(v)}"
-
-
-def _pct_abs(v: float) -> str:
-    if v == float("inf") or v == float("-inf"):
-        return f"from {_zero()}"
-    return f"{abs(v):.0f}%"
-
-
-def _direction_word(v: float) -> str:
-    if v > 0:
-        return "up"
-    if v < 0:
-        return "down"
-    return "flat"
-
-
-def _severity_emoji(pct: float) -> str:
-    if pct == float("inf") or pct >= 50:
-        return ":rotating_light:"
-    if pct >= 20:
-        return ":warning:"
-    if pct >= 5:
-        return ":large_yellow_circle:"
-    if pct > -5:
-        return ":white_circle:"
-    return ":large_green_circle:"
-
-
-def _trend_arrow(pct: float) -> str:
-    return ":chart_with_upwards_trend:" if pct >= 0 else ":chart_with_downwards_trend:"
-
-
-def _attachment_color(pct: float) -> str:
-    if pct == float("inf") or pct >= 50:
-        return "#d62728"   # red
-    if pct >= 20:
-        return "#ff7f0e"   # orange
-    if pct >= 5:
-        return "#f1c40f"   # yellow
-    if pct > -5:
-        return "#7f8c8d"   # gray
-    return "#2ca02c"       # green
-
-
-def _plural(n: int, word: str) -> str:
-    return f"{n} {word}" if n == 1 else f"{n} {word}s"
-
-
-def _rounds_to_zero(pct: float) -> bool:
-    """True when a percentage would render as '0%' — so we say 'about the same'
-    instead of the confusing 'up 0%' / 'down 0%'."""
-    return pct != float("inf") and round(abs(pct)) == 0
-
-
-def _vs_phrase(pct: float, abs_delta: float, noun: str) -> str:
-    """Natural-language change vs a baseline, e.g. 'down 8% from the same day last
-    week' or 'about the same as the day before'. Used in the summary sentence."""
-    if pct == float("inf"):
-        return f"up sharply from {noun}"
-    if _rounds_to_zero(pct):
-        return f"about the same as {noun}"
-    return f"{_direction_word(abs_delta)} {abs(pct):.0f}% from {noun}"
-
-
-def _humanize_total_line(label: str, pct: float, abs_delta: float, baseline_date: _date, baseline_value: float) -> str:
-    """A detail line under the summary, e.g.
-    '📉 Vs last week (Tue 07 Jul, ₹135,995): down 8%, ₹11,083 less'."""
-    arrow = _trend_arrow(pct)
-    ctx = f"{_fmt_date(baseline_date)}, {_money(baseline_value)}"
-    less_more = "less" if abs_delta < 0 else "more"
-    if pct == float("inf"):
-        return f"{arrow} {label} ({_fmt_date(baseline_date)}): *up from {_zero()}*"
-    if _rounds_to_zero(pct):
-        return f"{arrow} {label} ({ctx}): *about the same*, {_money(abs(abs_delta))} {less_more}"
-    return f"{arrow} {label} ({ctx}): *{_direction_word(abs_delta)} {abs(pct):.0f}%*, {_money(abs(abs_delta))} {less_more}"
+# Slack rejects a section text block over 3000 chars. Leave margin for the fence
+# and title.
+_MAX_BLOCK = 2800
 
 
 def _mention_text(mention: str) -> str:
-    """Slack mention syntax. Supports 'here', 'channel', user IDs (U...), and group IDs (S...)."""
+    """Slack mention syntax. Supports 'here', 'channel', user IDs (U…), group IDs (S…)."""
     if not mention:
         return ""
     m = mention.strip().lstrip("@")
@@ -136,476 +37,403 @@ def _mention_text(mention: str) -> str:
     return m
 
 
-def _main_color(dod_pct: float, wow_pct: float) -> str:
-    """Side-bar color for the main message based on the overall trend."""
-    worst_up = max(dod_pct, wow_pct)
-    if worst_up >= 20:
-        return "#d62728"   # red — meaningful overall increase
-    if worst_up >= 5:
-        return "#f1c40f"   # yellow — mild increase
-    if min(dod_pct, wow_pct) <= -5:
-        return "#2ca02c"   # green — overall down
-    return "#7f8c8d"       # gray — flat
+def _num(v: float, decimals: int = 2) -> str:
+    return f"{v:,.{decimals}f}"
 
 
-def _short_window(pct: float, abs_delta: float) -> str:
-    """Compact 'arrow + percent' for a per-project line, e.g. '↓10%'. Plain words,
-    no DoD/WoW jargon; the surrounding text says 'vs yesterday'/'vs last week'."""
+def _pct_cell(pct) -> str:
+    if pct is None:
+        return "-"
     if pct == float("inf"):
-        return "↑ new"
-    arrow = "↑" if abs_delta > 0 else ("↓" if abs_delta < 0 else "→")
-    return f"{arrow}{abs(pct):.0f}%"
+        return "new"
+    return f"{pct:+.0f}%"
 
 
-def _scope_line(scope: str, summary: dict, n_inc: int, n_dec: int) -> str:
-    """One-line per-project roll-up for the main message (multi-scope reports only).
+def _amount_pct(amount: float, pct, decimals: int = 0) -> str:
+    """Baseline amount with its percentage change in brackets, e.g. '17,628 (+6%)'.
 
-    Both windows are shown in plain language. The severity emoji keys off
-    max(day, week), so showing both keeps the colour explained (a scope flat vs
-    yesterday but down vs last week would otherwise look like an unexplained alarm).
+    Kept in one cell rather than two columns because the pair is only meaningful
+    together: the percentage says how much it moved, the amount says whether that
+    movement is worth anyone's attention.
     """
-    dod_pct = summary["total_dod_pct"]
-    wow_pct = summary["total_wow_pct"]
-    emoji = _severity_emoji(max(dod_pct, wow_pct))
-    moved = []
-    if n_inc:
-        moved.append(f"{n_inc}↑")
-    if n_dec:
-        moved.append(f"{n_dec}↓")
-    moved_str = " ".join(moved) if moved else "no moves"
-    return (
-        f"{emoji}  *{scope}* — {_money(summary['total'])}   "
-        f"{_short_window(dod_pct, summary['total_dod_abs'])} vs yesterday, "
-        f"{_short_window(wow_pct, summary['total_wow_abs'])} vs last week   ·  {moved_str}"
-    )
+    return f"{_num(amount, decimals)} ({_pct_cell(pct)})"
 
 
-def build_header_payload(
-    summary: dict,
-    increase_count: int,
-    decrease_count: int,
-    mention: str = "",
-    title: str = "AWS",
-    scope_rows: list[tuple] | None = None,
-) -> tuple[list[dict], list[dict]]:
-    """Returns (top_level_blocks, attachments_for_colored_body).
+def _mono_table(headers: list[str], rows: list[list[str]], left_cols=(0,)) -> str:
+    """Fixed-width table. Text columns left-aligned, numeric columns right-aligned.
 
-    `scope_rows` is [(scope, summary, n_inc, n_dec), ...] and is only rendered for
-    multi-scope reports (GCP, one row per project). Single-scope output is
-    byte-identical to the original AWS format.
+    Right-aligning the numbers is the entire point: it stacks the digits into a
+    column so magnitudes compare by eye, which is how a cost table actually gets
+    read.
     """
-    d = summary["date"]
-    total = summary["total"]
-    dod_pct = summary["total_dod_pct"]
-    wow_pct = summary["total_wow_pct"]
-    headline_emoji = _severity_emoji(max(dod_pct, wow_pct))
-
-    prev_total = total - summary["total_dod_abs"]
-    lw_total = total - summary["total_wow_abs"]
-    summary_sentence = (
-        f"Total spend was *{_ymoney(total)}* — "
-        f"{_vs_phrase(dod_pct, summary['total_dod_abs'], 'the day before')} ({_money(prev_total)}), "
-        f"and {_vs_phrase(wow_pct, summary['total_wow_abs'], 'the same day last week')} ({_money(lw_total)})."
-    )
-
-    parts = []
-    if increase_count:
-        parts.append(f":chart_with_upwards_trend: {_plural(increase_count, 'service')} increased")
-    if decrease_count:
-        parts.append(f":chart_with_downwards_trend: {_plural(decrease_count, 'service')} decreased")
-    verdict = " · ".join(parts) + "  ·  open the thread :arrow_down: for details"
-
-    mention_str = _mention_text(mention)
-    top_blocks: list[dict] = []
-    if mention_str:
-        top_blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": mention_str}})
-    top_blocks.append({
-        "type": "header",
-        "text": {"type": "plain_text", "text": f"💰 {title} Daily Cost Report — {d.strftime('%a %d %b %Y')}", "emoji": True},
-    })
-
-    blocks = [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"{headline_emoji}  {summary_sentence}"},
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"{_humanize_total_line('Vs yesterday', dod_pct, summary['total_dod_abs'], d - _td(days=1), prev_total)}\n"
-                    f"{_humanize_total_line('Vs last week', wow_pct, summary['total_wow_abs'], d - _td(days=7), lw_total)}"
-                ),
-            },
-        },
+    if not rows:
+        return ""
+    widths = [
+        max(len(headers[i]), max(len(r[i]) for r in rows))
+        for i in range(len(headers))
     ]
 
-    # Per-project roll-up, in the order configured (first project leads).
-    if scope_rows and len(scope_rows) > 1:
-        blocks.append({"type": "divider"})
+    def fmt(cells):
+        out = []
+        for i, c in enumerate(cells):
+            out.append(c.ljust(widths[i]) if i in left_cols else c.rjust(widths[i]))
+        return "  ".join(out).rstrip()
+
+    return "\n".join([fmt(headers)] + [fmt(r) for r in rows])
+
+
+def _chunk_code_blocks(title: str, table: str) -> list[dict]:
+    """Split an over-long table across several blocks, repeating the header row and
+    keeping the fence valid in each. Slack rejects the whole message otherwise."""
+    if not table:
+        return []
+    lines = table.split("\n")
+    header, body = lines[0], lines[1:]
+    blocks: list[dict] = []
+    current: list[str] = []
+    first = True
+
+    def flush():
+        nonlocal current, first
+        if not current:
+            return
+        prefix = f"{title}\n" if first else ""
         blocks.append({
             "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "*By project*\n" + "\n".join(
-                    _scope_line(s, summ, ni, nd) for s, summ, ni, nd in scope_rows
-                ),
-            },
+            "text": {"type": "mrkdwn",
+                     "text": prefix + "```\n" + header + "\n" + "\n".join(current) + "\n```"},
         })
+        current = []
+        first = False
 
-    blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": verdict}]})
-
-    body_attachment = {"color": _main_color(dod_pct, wow_pct), "blocks": blocks}
-    return top_blocks, [body_attachment]
-
-
-# Backwards-compat shim (--dry-run path).
-def build_header_blocks(summary: dict, increase_count: int, decrease_count: int, mention: str = "") -> list[dict]:
-    top, atts = build_header_payload(summary, increase_count, decrease_count, mention)
-    return top + [{"type": "section", "text": {"type": "mrkdwn", "text": "(body rendered as colored attachment below)"}}] + atts[0]["blocks"]
+    for line in body:
+        if sum(len(x) + 1 for x in current) + len(line) > _MAX_BLOCK:
+            flush()
+        current.append(line)
+    flush()
+    return blocks
 
 
-def _anomaly_sentence(a: Anomaly) -> str:
-    """Plain English explanation of what happened to this service."""
-    parts = []
-    # Headline change
-    if a.dod_pct == float("inf"):
-        parts.append(f"jumped from {_zero()} to *{_money(a.today)}*")
-    elif a.dod_pct >= 100:
-        parts.append(f"*more than doubled* — from {_money(a.yesterday)} to {_money(a.today)}")
-    elif a.dod_abs > 0:
-        parts.append(
-            f"went *up {_pct_abs(a.dod_pct)}* — from {_money(a.yesterday)} to {_money(a.today)} "
-            f"(+{_money(a.dod_abs)})"
-        )
-    else:
-        parts.append(f"was {_money(a.today)} yesterday (flat vs day before)")
-
-    # Add the WoW context if it's meaningful and different from the DoD story
-    if "WoW" in a.rules and a.wow_pct not in (float("inf"),):
-        parts.append(
-            f"and is *{_pct_abs(a.wow_pct)} higher* than the same day last week "
-            f"(was {_money(a.last_week)}, +{_money(a.wow_abs)})"
-        )
-    elif a.wow_pct == float("inf"):
-        parts.append(f"and was {_zero()} the same day last week")
-
-    return ", ".join(parts) + "."
+_CLOUD_NAMES = {"GMP": "Maps"}
 
 
-def _explain_rules(rules: list[str]) -> str:
-    if rules == ["DoD"]:
-        return "_Triggered: spike vs yesterday_"
-    if rules == ["WoW"]:
-        return "_Triggered: spike vs same day last week_"
-    return "_Triggered: spike vs both yesterday and last week_"
+def _cloud_name(cloud: str) -> str:
+    return _CLOUD_NAMES.get(cloud, cloud)
 
 
-def _reason_lines(movers: list[dict]) -> list[str]:
-    """For each usage type that went UP, explain in one line why it drove the service cost higher.
-    Usage types that stayed flat or dropped are not 'reasons' — we hide them."""
-    lines = []
-    upward = [m for m in movers if m["dod_abs"] > 0 or m["wow_abs"] > 0]
-    upward.sort(key=lambda m: max(m["dod_abs"], m["wow_abs"]), reverse=True)
-    for m in upward:
-        ut = m["usage_type"]
-        if m["yesterday"] == 0 and m["dod_abs"] > 0:
-            lines.append(
-                f"   • `{ut}` — *brand-new charge yesterday* of {_money(m['today'])} "
-                f"(was {_zero()} the day before)"
-            )
-        elif m["dod_abs"] > 0 and m["wow_abs"] > 0:
-            lines.append(
-                f"   • `{ut}` — went from {_money(m['yesterday'])} → *{_money(m['today'])}* "
-                f"(+{_money(m['dod_abs'])} vs day before, +{_money(m['wow_abs'])} vs last week)"
-            )
-        elif m["dod_abs"] > 0:
-            lines.append(
-                f"   • `{ut}` — went from {_money(m['yesterday'])} → *{_money(m['today'])}* "
-                f"(+{_money(m['dod_abs'])} vs day before)"
-            )
-        else:  # only wow_abs > 0
-            lines.append(
-                f"   • `{ut}` — *{_money(m['today'])}* today, +{_money(m['wow_abs'])} vs last week"
-            )
-    return lines
+def _display(section: dict, report: dict) -> str:
+    """Human label for a scope. Maps sections drop the project suffix when there is
+    only one — the billing project name is an implementation detail, 'Maps' is the
+    name everyone uses."""
+    if section["cloud"] == "GMP":
+        others = [s for s in report["sections"] if s["cloud"] == "GMP"]
+        return "Maps" if len(others) == 1 else section["label"].replace("GMP ", "Maps ")
+    return section["label"]
 
 
-def _terse_service_header(a: Anomaly, target: _date) -> str:
-    prev = target - _td(days=1)
-    lw = target - _td(days=7)
-    sev = _severity_emoji(max(a.dod_pct, a.wow_pct))
-    dod_part = (
-        f"+{_money(a.dod_abs)} ({_pct_abs(a.dod_pct)}) vs {_fmt_date(prev)}"
-        if a.dod_abs > 0 else f"{_money(a.dod_abs)} vs {_fmt_date(prev)}"
-    )
-    wow_part = (
-        f"+{_money(a.wow_abs)} ({_pct_abs(a.wow_pct)}) vs {_fmt_date(lw)}"
-        if a.wow_abs > 0 else f"{_money(a.wow_abs)} vs {_fmt_date(lw)}"
-    )
-    # Show the transition for whichever window actually triggered the flag, so the
-    # arrow direction matches the alert. If only WoW tripped, compare to last week.
-    if "DoD" in a.rules:
-        base_val, base_date = a.yesterday, prev
-    else:
-        base_val, base_date = a.last_week, lw
-    return (
-        f"{sev} *{a.service}*  `{_money(base_val)} → {_money(a.today)}`  _(vs {_fmt_date(base_date)})_\n"
-        f"{dod_part} · {wow_part}"
-    )
+def _cloud_order(report: dict) -> list[str]:
+    """Clouds ordered by spend, largest first, preserving first-seen order on ties."""
+    totals: dict[str, float] = {}
+    for s in report["sections"]:
+        totals[s["cloud"]] = totals.get(s["cloud"], 0.0) + s["total_report"]
+    return [c for c, _ in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)]
 
 
-def _fmt_qty(v: float, unit: str) -> str:
-    """Format a usage quantity.
+def build_root_blocks(cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
+    """Thread root: one line per cloud family, its spend, and its monthly budget.
 
-    AWS (Cost Explorer) reports a raw amount plus a coarse unit, so we convert
-    bytes -> GB and tidy the labels. GCP is different: we already ask BigQuery for
-    `usage.amount_in_pricing_units` alongside `usage.pricing_unit`, so the value is
-    ALREADY in its billing unit ("gibibyte month", "hour", "count") and must not be
-    converted again. Converting would be actively wrong — and the AWS substring
-    rules below are booby-trapped for GCP anyway: "byte-seconds" contains "byte",
-    and "gibibyte second" contains "second".
+    The root answers only "how much, and is that within budget". Every breakdown
+    lives in the thread, so the channel view stays four lines regardless of how
+    many accounts exist.
     """
-    u = (unit or "").lower()
+    d = report["date"]
+    t = report["totals"]
+    budgets = cfg.get("monthly_budgets") or {}
+    days = int(cfg.get("projection_days") or 30)
 
-    if _unit_style == "gcp":
-        if not u:
-            return f"{v:,.2f}"
-        if u == "count":
-            return f"{int(v):,}" if float(v).is_integer() else f"{v:,.2f}"
-        return f"{v:,.2f} {u}"
+    top_blocks: list[dict] = []
+    mention = _mention_text(cfg.get("mention", ""))
+    if mention:
+        top_blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": mention}})
+    top_blocks.append({
+        "type": "header",
+        "text": {"type": "plain_text", "text": f"Cloud Costs On {d.isoformat()}", "emoji": True},
+    })
 
-    # --- AWS ---
-    if "byte" in u or u == "gb":
-        # CE returns bytes-based usage in GB already for most data-transfer types,
-        # but some come as raw bytes. Show in GB if value looks like GB, else bytes→GB.
-        gb = v if u == "gb" else v / 1_000_000_000
-        return f"{gb:,.2f} GB"
-    if "hour" in u or u == "hrs":
-        return f"{v:,.1f} hours"
-    if "request" in u or u == "requests":
-        return f"{int(v):,} requests"
-    if "second" in u:
-        return f"{v:,.0f} sec"
-    if "count" in u:
-        return f"{int(v):,}"
-    # fallback — show raw + the unit string AWS returned
-    if v >= 1000:
-        return f"{v:,.1f} {unit}".strip()
-    return f"{v:,.2f} {unit}".strip()
+    cloud_total = sum(v for c, v in t["by_cloud"].items() if c != "GMP")
+    maps_total = t["by_cloud"].get("GMP", 0.0)
+    cloud_budget = sum(v for c, v in budgets.items() if c != "GMP" and v)
+    maps_budget = budgets.get("GMP") or 0
 
-
-def _qty_change_phrase(m: dict, basis: str) -> str:
-    """basis is 'dod' or 'wow' — describe the usage-quantity change for that comparison."""
-    unit = m.get("unit", "")
-    if basis == "dod":
-        q_now, q_then = m["qty_today"], m["qty_yesterday"]
-    else:
-        q_now, q_then = m["qty_today"], m["qty_last_week"]
-    if q_now == 0 and q_then == 0:
-        return ""
-    return f"{_fmt_qty(q_then, unit)} → {_fmt_qty(q_now, unit)}"
-
-
-def _terse_reason_lines(movers: list[dict], target: _date) -> list[str]:
-    prev = target - _td(days=1)
-    lw = target - _td(days=7)
-    lines = []
-    upward = [m for m in movers if m["dod_abs"] > 0 or m["wow_abs"] > 0]
-    upward.sort(key=lambda m: max(m["dod_abs"], m["wow_abs"]), reverse=True)
-    for m in upward:
-        ut = m["usage_type"]
-        basis = "dod" if m["dod_abs"] > 0 else "wow"
-        baseline = prev if basis == "dod" else lw
-        delta_cost = m["dod_abs"] if basis == "dod" else m["wow_abs"]
-        qty_phrase = _qty_change_phrase(m, basis)
-
-        # Cost baseline must match the window that triggered: yesterday for DoD, last week for WoW.
-        base_cost = m["yesterday"] if basis == "dod" else m["last_week"]
-
-        if base_cost == 0 and m["today"] > 0:
-            usage_today = _fmt_qty(m["qty_today"], m.get("unit", ""))
-            lines.append(
-                f"• `{ut}` — *new charge* of {_money(m['today'])}; usage: {usage_today} "
-                f"(was {_zero()} / 0 on {_fmt_date(baseline)})"
-            )
-        else:
-            qty_part = f" ; usage: {qty_phrase}" if qty_phrase else ""
-            lines.append(
-                f"• `{ut}` — cost {_money(base_cost)} → *{_money(m['today'])}* "
-                f"(+{_money(delta_cost)} vs {_fmt_date(baseline)}){qty_part}"
-            )
-    return lines
-
-
-def _down_header(a: Anomaly, target: _date) -> str:
-    prev = target - _td(days=1)
-    lw = target - _td(days=7)
-    dod_part = f"{_money(a.dod_abs)} ({_pct_abs(a.dod_pct)}) vs {_fmt_date(prev)} ({_money(a.yesterday)})"
-    wow_part = f"{_money(a.wow_abs)} ({_pct_abs(a.wow_pct)}) vs {_fmt_date(lw)} ({_money(a.last_week)})"
-    # Show the transition for whichever window actually triggered the flag, mirroring
-    # _terse_service_header. Hardcoding yesterday->today renders an upward arrow under
-    # the "decreased" heading whenever only WoW tripped (e.g. flat vs yesterday, down
-    # 13% vs last week) — which reads as a contradiction.
-    if "DoD" in a.rules:
-        base_val, base_date = a.yesterday, prev
-    else:
-        base_val, base_date = a.last_week, lw
-    return (
-        f":large_green_circle: *{a.service}*  `{_money(base_val)} → {_money(a.today)}`  _(vs {_fmt_date(base_date)})_\n"
-        f"{dod_part} · {wow_part}"
-    )
-
-
-def _down_reason_lines(movers: list[dict], target: _date) -> list[str]:
-    prev = target - _td(days=1)
-    lw = target - _td(days=7)
-    downward = [m for m in movers if m["dod_abs"] < 0 or m["wow_abs"] < 0]
-    downward.sort(key=lambda m: min(m["dod_abs"], m["wow_abs"]))
-    lines = []
-    for m in downward:
-        ut = m["usage_type"]
-        if m["dod_abs"] < 0:
-            baseline, delta, base_cost, qty_then, qty_now = prev, m["dod_abs"], m["yesterday"], m["qty_yesterday"], m["qty_today"]
-        else:
-            baseline, delta, base_cost, qty_then, qty_now = lw, m["wow_abs"], m["last_week"], m["qty_last_week"], m["qty_today"]
-        unit = m.get("unit", "")
-        qty_part = f" ; usage: {_fmt_qty(qty_then, unit)} → {_fmt_qty(qty_now, unit)}" if (qty_then or qty_now) else ""
-        lines.append(
-            f"• `{ut}` — cost {_money(base_cost)} → *{_money(m['today'])}* "
-            f"({_money(delta)} vs {_fmt_date(baseline)}){qty_part}"
-        )
-    return lines
-
-
-def build_thread_attachments(summary: dict, increases: list[Anomaly], decreases: list[Anomaly], movers_by_service: dict[str, list[dict]]) -> list[dict]:
-    target = summary["date"]
-    attachments = []
-
-    if increases:
-        attachments.append({
-            "color": "#34495e",
-            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": f":chart_with_upwards_trend: *Services that increased ({len(increases)})*"}}],
-        })
-        for a in increases:
-            blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": _terse_service_header(a, target)}}]
-            reasons = _terse_reason_lines(movers_by_service.get(a.service, []), target)
-            if reasons:
-                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(reasons)}})
-            attachments.append({
-                "color": _attachment_color(max(a.dod_pct, a.wow_pct)),
-                "blocks": blocks,
-            })
-
-    if decreases:
-        attachments.append({
-            "color": "#34495e",
-            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": f":chart_with_downwards_trend: *Services that decreased ({len(decreases)})*"}}],
-        })
-        for a in decreases:
-            blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": _down_header(a, target)}}]
-            reasons = _down_reason_lines(movers_by_service.get(a.service, []), target)
-            if reasons:
-                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(reasons)}})
-            attachments.append({
-                "color": "#2ca02c",
-                "blocks": blocks,
-            })
-
-    return attachments
-
-
-def combine_summaries(results: list[dict]) -> dict:
-    """Roll per-scope summaries up into one account-wide summary for the header.
-
-    Percentages are recomputed from the summed absolutes — averaging the per-scope
-    percentages would weight a tiny project the same as a huge one.
-    """
-    total = sum(r["summary"]["total"] for r in results)
-    dod_abs = sum(r["summary"]["total_dod_abs"] for r in results)
-    wow_abs = sum(r["summary"]["total_wow_abs"] for r in results)
-    prev = total - dod_abs
-    lw = total - wow_abs
-
-    def _pct(curr: float, base: float) -> float:
-        if base <= 0:
-            return float("inf") if curr > 0 else 0.0
-        return (curr - base) / base * 100.0
-
-    return {
-        "date": results[0]["summary"]["date"],
-        "total": total,
-        "total_dod_abs": dod_abs,
-        "total_wow_abs": wow_abs,
-        "total_dod_pct": _pct(total, prev),
-        "total_wow_pct": _pct(total, lw),
-    }
-
-
-def build_thread_attachments_multi(results: list[dict]) -> list[dict]:
-    """Thread breakdown across scopes. Scope order is preserved from `results`.
-
-    Scopes with nothing to report are skipped entirely rather than rendering an
-    empty header — the zero-noise contract applies per scope too.
-    """
-    single = len(results) == 1
-    attachments: list[dict] = []
-    for r in results:
-        if not r["increases"] and not r["decreases"]:
+    entries = []
+    for cloud in _cloud_order(report):
+        if cloud == "GMP":
             continue
-        if not single:
-            attachments.append({
-                "color": "#1f77b4",
-                "blocks": [{
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f":file_folder:  *{r['scope']}*"},
-                }],
-            })
-        attachments.extend(
-            build_thread_attachments(r["summary"], r["increases"], r["decreases"], r["movers"])
-        )
-    return attachments
+        entries.append((f"{_cloud_name(cloud)} All Accounts", t["by_cloud"][cloud],
+                        budgets.get(cloud)))
+    if maps_total:
+        entries.append(("Maps Total", maps_total, maps_budget or None))
+    entries.append(("Cloud + Maps Total", cloud_total + maps_total,
+                    (cloud_budget + maps_budget) or None))
+
+    # The goal is shown as a DAILY figure (monthly budget / projection days) so it
+    # sits in the same units as the cost beside it. Comparing a day's spend to a
+    # monthly budget in the same row invites a 30x misreading.
+    rows = []
+    for label, val, budget in entries:
+        daily_goal = (budget / days) if budget else None
+        pct = ((val - daily_goal) / daily_goal * 100.0) if daily_goal else None
+        diff = (val - daily_goal) if daily_goal else None
+        rows.append([
+            label,
+            money.fmt(cfg, val),
+            money.fmt(cfg, daily_goal) if daily_goal else "-",
+            # Rupees first, percent in brackets — a percentage alone cannot say
+            # whether the gap is worth chasing.
+            (("+" if diff > 0 else "") + money.fmt(cfg, diff) + f" ({pct:+.0f}%)")
+            if daily_goal else "-",
+        ])
+    # A one-line verdict above the table. Emoji live outside the code block on
+    # purpose — inside it they are double-width and shear the column alignment.
+    total_budget = sum(v for v in budgets.values() if v)
+    body = []
+    if total_budget:
+        projected = t["grand_total"] * days
+        over = projected - total_budget
+        pct = over / total_budget * 100.0
+        emoji = ":red_circle:" if pct >= 10 else (":large_yellow_circle:" if pct > 0
+                                                  else ":large_green_circle:")
+        verdict = (f"{emoji}  *{abs(pct):.0f}% {'over' if over > 0 else 'under'} budget* — "
+                   f"{money.fmt(cfg, abs(over))}/month {'above' if over > 0 else 'below'} plan")
+        body.append({"type": "section", "text": {"type": "mrkdwn", "text": verdict}})
+    body.append({"type": "section", "text": {"type": "mrkdwn",
+        "text": "```\n" + _mono_table(["Account", "Current", "Goal/day", "Rate"], rows)
+                + "\n```"}})
+    return top_blocks, [{"color": _root_color(cfg, report), "blocks": body}]
 
 
-def post(cfg: dict, results: list[dict], title: str = "AWS") -> None:
-    """Post one report covering every scope in `results` (order preserved).
+def _root_color(cfg: dict, report: dict) -> str:
+    """Red when the overall run-rate is over budget, grey when there is no budget."""
+    budgets = cfg.get("monthly_budgets") or {}
+    total_budget = sum(v for v in budgets.values() if v)
+    if not total_budget:
+        return "#7f8c8d"
+    days = int(cfg.get("projection_days") or 30)
+    projected = report["totals"]["grand_total"] * days
+    pct = (projected - total_budget) / total_budget * 100.0
+    return "#d62728" if pct >= 10 else ("#f1c40f" if pct > 0 else "#2ca02c")
 
-    results: [{scope, summary, increases, decreases, movers}, ...]
+
+def _account_split_blocks(cfg: dict, report: dict, clouds, title: str) -> list[dict]:
+    """Per-account totals for the given clouds, with a total row."""
+    # Largest spender first — the order someone scanning for "where does the money
+    # go" wants. The TOTAL row stays pinned at the bottom.
+    secs = sorted([s for s in report["sections"] if s["cloud"] in clouds],
+                  key=lambda x: x["total_report"], reverse=True)
+    if not secs:
+        return []
+    rc = cfg["report_currency"]
+    dec = 0 if rc == "INR" else 2
+    rows = [[_display(s, report), _num(s["total_report"], dec),
+             _amount_pct(s["prev_total_report"], s["dod_pct"], dec),
+             _amount_pct(s["lw_total_report"], s["wow_pct"], dec)] for s in secs]
+    total = sum(s["total_report"] for s in secs)
+    prev = sum(s["prev_total_report"] for s in secs)
+    lw = sum(s["lw_total_report"] for s in secs)
+    rows.append(["TOTAL", _num(total, dec),
+                 _amount_pct(prev, _pct_of(total, prev), dec),
+                 _amount_pct(lw, _pct_of(total, lw), dec)])
+    return _chunk_code_blocks(
+        title, _mono_table(["Account", f"cost{rc}", "vs prev day", "vs last week"], rows))
+
+
+def _pct_of(curr, base):
+    if base <= 0:
+        return float("inf") if curr > 0 else 0.0
+    return (curr - base) / base * 100.0
+
+
+def _runrate_blocks(cfg: dict, report: dict) -> list[dict]:
+    proj = collect.monthly_projection(cfg, report)
+    if not proj:
+        return []
+    days = int(cfg.get("projection_days") or 30)
+    rows = [[e["label"], money.fmt(cfg, e["projected"]),
+             money.fmt(cfg, e["budget"]) if e["budget"] else "-",
+             # Signed amount as well as percent: "+136%" on a small budget and
+             # "+10%" on a large one can be the same rupees, and the rupees are
+             # what actually has to be found.
+             (("+" if e["diff"] > 0 else "") + money.fmt(cfg, e["diff"]))
+             if e.get("diff") is not None else "-",
+             f"{e['pct']:+.0f}%" if e["pct"] is not None else "-",
+             ("OVER" if e["pct"] > 0 else "under") if e["pct"] is not None else ""]
+            for e in proj]
+    return _chunk_code_blocks(
+        f"*Monthly run-rate* _(today x {days})_",
+        _mono_table(["Bucket", "Projected", "Budget", "Over/under", "vs Budget", ""], rows))
+
+
+def _per_ride_blocks(cfg: dict, report: dict) -> list[dict]:
+    econ = collect.unit_economics(cfg, report)
+    if not econ:
+        return []
+    rows = [[e["label"], money.fmt(cfg, e["cost"]), f"{e['rides']:,}",
+             money.fmt(cfg, e["per_ride"], decimals=2)] for e in econ]
+    rides = report["rides"]
+    src = "  ·  ".join(f"{k}: {v:,}" for k, v in (rides.get("by_source") or {}).items())
+    blocks = _chunk_code_blocks("*Cost per ride*",
+                                _mono_table(["Basis", "Cost", "Rides", "Per ride"], rows))
+    if src:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": src}]})
+    return blocks
+
+
+def _section_table_blocks(cfg: dict, report: dict, section: dict, limit: int = 20) -> list[dict]:
+    """Per-service table for one account.
+
+    Each baseline is shown as an AMOUNT next to its percentage. A percentage alone
+    is unreadable without the number behind it — "+217%" could be ₹6 to ₹18 or
+    ₹6,000 to ₹18,000, and those warrant completely different reactions.
     """
-    client = WebClient(token=cfg["slack_bot_token"])
-
-    combined = combine_summaries(results)
-    scope_rows = [
-        (r["scope"], r["summary"], len(r["increases"]), len(r["decreases"]))
-        for r in results
+    rc = cfg["report_currency"]
+    dec = 0 if rc == "INR" else 2
+    rows = [
+        [row["service"][:34],
+         _num(row["today_report"], dec),
+         _amount_pct(row["yesterday_report"], row["dod_pct"], dec),
+         _amount_pct(row["last_week_report"], row["wow_pct"], dec)]
+        for row in section["rows"][:limit]
     ]
-    total_inc = sum(len(r["increases"]) for r in results)
-    total_dec = sum(len(r["decreases"]) for r in results)
+    if not rows:
+        return []
 
-    top_blocks, body_attachments = build_header_payload(
-        combined, total_inc, total_dec, cfg.get("mention", ""), title=title, scope_rows=scope_rows
-    )
+    title = f"*{_display(section, report)}* — {money.fmt(cfg, section['total_report'])}"
+    if len(rows) < len(section["rows"]):
+        # Never let a cap read as full coverage.
+        title += f"  _(top {len(rows)} of {len(section['rows'])}; full list in the workbook)_"
+    return _chunk_code_blocks(
+        title,
+        _mono_table(["Service", f"cost{rc}", "vs prev day", "vs last week"], rows))
+
+
+def _gmp_table_blocks(cfg: dict, report: dict, limit: int = 20) -> list[dict]:
+    """Google Maps per-API table: requests alongside cost, as the old report had it.
+
+    Requests carry the signal here — several Maps APIs sit in a free tier and bill
+    at zero, so a cost-only view renders a million calls as a blank line.
+    """
+    df = report.get("gmp_apis")
+    if df is None or df.empty:
+        return []
+    rc = cfg["report_currency"]
+    dec = 0 if rc == "INR" else 2
+    shown = df.head(limit)
+    rows = [
+        [str(r["service"])[:34], _num(float(r["requests"] or 0), 0), _num(float(r["cost"] or 0), dec)]
+        for _, r in shown.iterrows()
+    ]
+    if not rows:
+        return []
+    # Total across ALL APIs, not just the rows shown — a truncated total would
+    # understate Maps and disagree with the root message.
+    rows.append(["TOTAL",
+                 _num(float(df["requests"].fillna(0).sum()), 0),
+                 _num(float(df["cost"].fillna(0).sum()), dec)])
+    title = "*Google Maps Platform*"
+    if len(shown) < len(df):
+        title += f"  _(top {len(shown)} of {len(df)}; TOTAL covers all)_"
+    return _chunk_code_blocks(title, _mono_table(["service", "requests", f"current{rc}"], rows))
+
+
+def _movers_blocks(cfg: dict, report: dict, limit: int = 10) -> list[dict]:
+    """Biggest day-over-day increases across every account.
+
+    Ranked by absolute money moved, not percent: a 400% jump on a ₹20 service is
+    trivia, while a 12% rise on the biggest line item is what's worth chasing.
+    """
+    movers = []
+    for s in report["sections"]:
+        for row in s["rows"]:
+            delta = row["today_report"] - row["yesterday_report"]
+            if delta > 0:
+                movers.append({
+                    "delta": delta,
+                    "account": _display(s, report),
+                    "service": row["service"],
+                    "today": row["today_report"],
+                    "prev": row["yesterday_report"],
+                    "pct": row["dod_pct"],
+                })
+    if not movers:
+        return []
+    movers.sort(reverse=True, key=lambda m: m["delta"])
+    rc = cfg["report_currency"]
+    dec = 0 if rc == "INR" else 2
+    # Both absolute levels are shown, not just the delta: "+6,537" means something
+    # different on a ₹33k line than on a ₹300 one, and the rank order alone does
+    # not convey that.
+    rows = [[m["service"][:30], m["account"][:16], _num(m["today"], dec),
+             _num(m["prev"], dec), "+" + _num(m["delta"], dec), _pct_cell(m["pct"])]
+            for m in movers[:limit]]
+    return _chunk_code_blocks(
+        "*Biggest increases vs the previous day*",
+        _mono_table(["Service", "Account", f"cost{rc}", "prev day", "increase", "vs prev"],
+                    rows, left_cols=(0, 1)))
+
+
+def post(cfg: dict, report: dict, xlsx_path: str) -> None:
+    """Root message, then the breakdown as threaded replies, then the workbook."""
+    client = WebClient(token=cfg["slack_bot_token"])
+    d = report["date"]
+
+    top_blocks, attachments = build_root_blocks(cfg, report)
     main = client.chat_postMessage(
         channel=cfg["slack_channel_id"],
         blocks=top_blocks,
-        attachments=body_attachments,
-        text=f"{title} daily cost report — {combined['date'].isoformat()}",
+        attachments=attachments,
+        text=f"Cloud cost report — {d.isoformat()}",
         unfurl_links=False,
         unfurl_media=False,
     )
+    channel, ts = main["channel"], main["ts"]
 
-    # Slack accepts at most ~50 attachments per message; a high-cardinality day
-    # (many services flagged) could exceed that and fail the whole thread post.
-    # Chunk into multiple threaded replies so the breakdown always lands intact.
-    thread_atts = build_thread_attachments_multi(results)
-    CHUNK = 50
-    for i in range(0, len(thread_atts), CHUNK):
-        client.chat_postMessage(
-            channel=main["channel"],
-            thread_ts=main["ts"],
-            text="Detailed breakdown",
-            attachments=thread_atts[i:i + CHUNK],
-            unfurl_links=False,
-            unfurl_media=False,
-        )
+    def reply(blocks, fallback):
+        if blocks:
+            client.chat_postMessage(channel=channel, thread_ts=ts, text=fallback,
+                                    blocks=blocks, unfurl_links=False, unfurl_media=False)
+
+    clouds = {s["cloud"] for s in report["sections"] if s["cloud"] != "GMP"}
+
+    # 1 — account split of the infrastructure clouds
+    reply(_account_split_blocks(cfg, report, clouds, "*Cloud — account split*"),
+          "Cloud account split")
+
+    # 2 — Maps: project split plus the per-API request volumes
+    maps_blocks = _account_split_blocks(cfg, report, {"GMP"}, "*Maps — account split*")
+    maps_blocks += _gmp_table_blocks(cfg, report)
+    reply(maps_blocks, "Maps breakdown")
+
+    # 3 — monthly run-rate against budget
+    reply(_runrate_blocks(cfg, report), "Monthly run-rate")
+
+    # 4 — unit economics
+    reply(_per_ride_blocks(cfg, report), "Cost per ride")
+
+    # Detail: per-service tables, then the biggest movers.
+    for section in sorted(report["sections"], key=lambda x: x["total_report"], reverse=True):
+        if section["cloud"] == "GMP":
+            continue          # already covered by the per-API table above
+        reply(_section_table_blocks(cfg, report, section), f"{section['label']} breakdown")
+    reply(_movers_blocks(cfg, report), "Biggest increases")
+
+    # The workbook is the deliverable — if the upload fails the run has not really
+    # succeeded, so this is allowed to raise rather than being swallowed.
+    client.files_upload_v2(
+        channel=channel,
+        thread_ts=ts,
+        file=xlsx_path,
+        filename=f"{d.isoformat()}-cloud-costs.xlsx",
+        title=f"Cloud costs {d.isoformat()}",
+        initial_comment="Full per-service breakdown, 7 days per account.",
+    )
+    log.info("Posted report and workbook to %s", cfg["slack_channel_id"])
