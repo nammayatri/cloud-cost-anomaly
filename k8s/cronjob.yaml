@@ -1,12 +1,38 @@
+---
+# Daily cloud cost report: every AWS account + every GCP project + Google Maps,
+# with ride counts for unit economics.
+#
+# WHERE THIS RUNS AND WHY
+# -----------------------
+# The job needs four things at once:
+#   1. AWS Cost Explorer in every account  -> IRSA here + sts:AssumeRole elsewhere
+#   2. BigQuery billing exports            -> GCP credentials
+#   3. ClickHouse for ride counts          -> network reachability
+#   4. An FX endpoint                      -> outbound internet
+#
+# Only (3) is location-bound, so put the job wherever ClickHouse is reachable and
+# bring the other credentials in. Here that is the AWS cluster, so GCP creds are
+# mounted rather than inherited.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cost-report
+  namespace: <NAMESPACE>
+  annotations:
+    # IRSA role in this cluster's account. Needs ce:GetCostAndUsage, plus
+    # sts:AssumeRole on each cross-account reader role listed in AWS_ACCOUNTS.
+    eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/<IRSA_ROLE>
+---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: cost-anomaly-cron
+  name: cloud-cost-report
   namespace: <NAMESPACE>
 spec:
-  # 12:00 UTC. Time chosen so yesterday's Cost Explorer data has settled.
-  schedule: "0 12 * * *"
-  timeZone: "Etc/UTC"
+  # 17:00 IST. The report covers T-2, so by this hour every provider has finished
+  # restating that day — the numbers will not move again afterwards.
+  schedule: "0 17 * * *"
+  timeZone: "Asia/Kolkata"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
@@ -16,37 +42,120 @@ spec:
       template:
         spec:
           restartPolicy: OnFailure
-          # The service account must have an IAM role attached (IRSA on EKS, Workload Identity on GKE)
-          # with the action `ce:GetCostAndUsage`. See README for the minimal policy.
-          serviceAccountName: <SERVICE_ACCOUNT>
+          serviceAccountName: cost-report
           containers:
-            - name: cost-anomaly-cron
-              image: <YOUR_REGISTRY>/cost-anomaly-cron:<TAG>
+            - name: cloud-cost-report
+              image: <YOUR_REGISTRY>/cost-report:<TAG>
               imagePullPolicy: IfNotPresent
               env:
+                - name: PROVIDER
+                  value: "all"
+
+                # --- AWS: one report tab per account --------------------------
+                # Accounts too small to be worth a tab are simply left out.
                 - name: AWS_REGION
-                  value: "<AWS_REGION>"
-                - name: INCREASE_PCT_THRESHOLD
-                  value: "10"
-                - name: DECREASE_PCT_THRESHOLD
-                  value: "5"
-                - name: ABS_THRESHOLD
-                  value: "1"
-                - name: NOISE_FLOOR
-                  value: "1"
+                  value: "<REGION_A>"
+                - name: AWS_ACCOUNTS
+                  value: |
+                    [
+                      {"label": "<ACCOUNT_A_LABEL>", "region": "<REGION_A>"},
+                      {"label": "<ACCOUNT_B_LABEL>", "region": "<REGION_B>",
+                       "role_arn": "arn:aws:iam::<ACCOUNT_B_ID>:role/cost-report-reader"}
+                    ]
+
+                # --- GCP infrastructure billing export ------------------------
+                - name: GCP_PROJECT
+                  value: "<BQ_JOB_PROJECT>"
+                - name: GCP_BILLING_TABLE
+                  value: "<PROJECT>.<DATASET>.<BILLING_EXPORT_TABLE>"
+                - name: GCP_PROJECTS
+                  value: "<PROJECT_A>,<PROJECT_B>"
+
+                # --- Google Maps Platform (own billing account + export) ------
+                - name: GMP_BILLING_TABLE
+                  value: "<MAPS_PROJECT>.<MAPS_DATASET>.<MAPS_EXPORT_TABLE>"
+                - name: GMP_PROJECTS
+                  value: "<MAPS_PROJECT>"
+
+                # GCP credentials. Option A (shown): a mounted service-account key.
+                # Option B (preferred, keyless): AWS->GCP Workload Identity
+                # Federation — drop the volume and mount a credential config
+                # instead. Option A is here because it works without a federation
+                # pool already in place.
+                - name: GOOGLE_APPLICATION_CREDENTIALS
+                  value: "/var/secrets/gcp/key.json"
+
+                # --- Ride counts (ClickHouse) ---------------------------------
+                # The SQL lives in a ConfigMap, not in the image: it embeds
+                # internal schema, and "what counts as a ride" is a business
+                # definition that should change without a redeploy.
+                - name: RIDE_QUERY_DIR
+                  value: "/etc/cost-report/queries"
+                - name: CLICKHOUSE_HOST
+                  valueFrom:
+                    secretKeyRef: { name: <CH_SECRET>, key: <CH_HOST_KEY> }
+                - name: CLICKHOUSE_USER
+                  valueFrom:
+                    secretKeyRef: { name: <CH_SECRET>, key: <CH_USER_KEY> }
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef: { name: <CH_SECRET>, key: <CH_PASSWORD_KEY> }
+                # secretKeyRef cannot cross namespaces — replicate the secret if
+                # this CronJob does not live alongside it.
+                - name: CLICKHOUSE_DATABASE
+                  value: "default"
+                # Which ride source is the base count; the rest (e.g. tickets) are
+                # additive. Defaults to the first query file in filename order.
+                - name: PRIMARY_RIDE_SOURCE
+                  value: "rides"
+
+                # --- Reporting ------------------------------------------------
+                - name: REPORT_CURRENCY
+                  value: "<CURRENCY>"
+                # USD->INR is fetched for the target day. This is the fallback
+                # used only if that fetch fails.
+                - name: USD_INR_RATE
+                  value: "88.0"
+                # Monthly budget per cloud, in the reporting currency.
+                - name: MONTHLY_BUDGETS
+                  value: '{"AWS": 0, "GCP": 0, "GMP": 0}'
+                - name: PROJECTION_DAYS
+                  value: "30"
                 - name: LOOKBACK_DAYS
                   value: "21"
-                - name: TOP_USAGE_TYPES
-                  value: "3"
                 - name: MENTION
-                  value: ""   # set to "here", "channel", or a Slack user/group id to ping on every post
+                  value: "here"
+
+                # --- Optional second destination (Slack-compatible adapter) ----
+                # Omit all three to post to Slack only. The channel is a NAME
+                # without a leading "#".
+                - name: XYNE_BASE_URL
+                  value: "<XYNE_HOST>"
+                - name: XYNE_CHANNEL
+                  value: "<XYNE_CHANNEL>"
               envFrom:
                 - secretRef:
-                    name: cost-anomaly-cron-secret
+                    name: cost-report-secret
+              volumeMounts:
+                - name: gcp-key
+                  mountPath: /var/secrets/gcp
+                  readOnly: true
+                - name: queries
+                  mountPath: /etc/cost-report/queries
+                  readOnly: true
               resources:
                 requests:
-                  cpu: "100m"
-                  memory: "256Mi"
-                limits:
-                  cpu: "500m"
+                  cpu: "200m"
                   memory: "512Mi"
+                limits:
+                  cpu: "1000m"
+                  # Pandas pivots 21 days x every service x several accounts, then
+                  # xlsxwriter holds the whole workbook in memory before writing.
+                  memory: "1Gi"
+          volumes:
+            - name: gcp-key
+              secret:
+                secretName: gcp-billing-reader-key
+            - name: queries
+              configMap:
+                name: cost-report-queries

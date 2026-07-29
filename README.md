@@ -1,10 +1,10 @@
 <div align="center">
 
-# Cloud Cost Anomaly Cron
+# Cloud Cost Report
 
-**Daily cloud cost anomaly detection — straight to Slack. AWS and GCP.**
+**Daily multi-cloud cost report — Slack summary + Excel workbook. AWS, GCP and Google Maps.**
 
-A small, opinionated Kubernetes CronJob that watches your cloud bill day by day, surfaces the services that moved meaningfully, drills down to the exact usage type (AWS) or SKU (GCP) responsible — and stays silent when nothing's wrong. One `--provider` flag switches between AWS Cost Explorer and the GCP BigQuery billing export; the detection and Slack formatting are shared.
+A small Kubernetes CronJob that pulls every AWS account, every GCP project and the Google Maps Platform bill into one report: a Slack summary with cost-per-ride against goal, plus a workbook with a tab per account showing every service across the last 7 days.
 
 <br/>
 
@@ -24,91 +24,73 @@ A small, opinionated Kubernetes CronJob that watches your cloud bill day by day,
 
 ## ✨ Why this exists
 
-AWS billing surprises usually arrive on the **first of next month** — by then the leak has been running for weeks. This cron flips that:
+Cloud billing surprises usually arrive on the **first of next month** — by then the leak has been running for weeks. This job flips that:
 
-- **Yesterday's bill, this morning** — 24h lag, never more
-- **Both seasonalities** — flags spikes vs the previous day **and** vs the same weekday last week, so weekend rhythms don't trigger false alarms
-- **Names the culprit** — not just *"EC2-Other went up"*, but *"NAT-Gateway data transfer went from 0 GB to 47 GB"*
-- **Silent unless something matters** — no daily noise post; if every service stayed within thresholds, the cron exits without messaging
+- **The whole bill in one place** — every AWS account, every GCP project, and Maps, added up in a single currency
+- **Unit economics, not just totals** — cost per ride against goal, so spend is judged against the thing it buys
+- **A week of context per service** — 7 daily columns, not a today/yesterday pair, so weekday rhythm is distinguishable from a real step change
+- **Numbers that don't move** — targets T-2, after both clouds have finished restating
 
-## 📥 What lands in Slack
+## 🧠 What the report contains
 
-<table>
-<tr>
-<td valign="top" width="50%">
+The run targets **T-2 (the day before yesterday)**, not T-1. Both AWS and GCP restate billing rows for roughly 24–48h after the usage day, and GCP is the slower of the two. Reporting T-1 means routinely publishing partial numbers that produce phantom drops which vanish overnight — the fastest way to teach a channel to ignore a bot. One extra day of latency buys numbers that never move after the fact.
 
-### Main message
-- 📅 Date, day of week
-- 💰 Total spend, with **both** baselines shown in dollars
-- 📈 / 📉 One-line tally of services that moved
-- 🎨 Colored side-bar: 🟥 if total is up, 🟩 if down, ⬜ if flat
-- 🔔 Optional `@here` / `@channel` / user / usergroup mention
+**Slack message** — the headline: spend per cloud with contribution %, total, ride count, and cost-per-ride against goal. Then a per-account roll-up, and a threaded reply listing the biggest day-over-day increases (ranked by *money moved*, not percent — a 400% jump on a ₹20 service is trivia).
 
-</td>
-<td valign="top" width="50%">
+**Workbook** (threaded attachment) — one tab per account/project:
 
-### Thread reply
-- 🟥 **Services that increased** — red attachments
-- 🟩 **Services that decreased** — green attachments
-- Each card shows the actual comparison dates **and** baseline dollars
-- Below each card, bullet list of the **usage types** that drove the change with **GB / hours / requests** (not just dollars)
+| Tab | Contents |
+|---|---|
+| `Summary` | Spend by cloud + share, total, rides, cost-per-ride vs goal, per-cloud unit economics, per-account roll-up |
+| One per AWS account | Every service × the last 7 days, plus 7-day total and both deltas |
+| One per GCP project | Same grid |
+| `GMP (Maps)` | Per-API request volume, net cost, and cost per 1,000 requests |
 
-</td>
-</tr>
-</table>
+Detail tabs are a **7-day grid**, not a today/yesterday pair: a single day-pair can't distinguish a real step change from ordinary weekday noise. A colour ramp across the day columns turns each tab into a heat map, so "climbing since Tuesday" and "spikes every Saturday" are visible without reading a number.
 
-## 🧠 How detection works
+### Currency
 
-For each AWS service, for **yesterday (T-1)**:
+Every cloud is rolled into one `report_currency` (INR). Cost Explorer only ever returns USD, so AWS is converted at `usd_inr_rate` — **pinned in config, never fetched live**. A cron whose headline moves because an FX API drifted overnight manufactures exactly the false anomaly this tool exists to suppress, and it would be unauditable after the fact. Detail tabs show both native and converted figures so an AWS tab can still be reconciled against the AWS console.
 
-| Check | Logic | Default |
-|---|---|---|
-| **Day-over-day** | Cost vs T-2 | flagged if up >10% **and** moved more than $1 |
-| **Week-over-week** | Cost vs T-8 (same weekday) | flagged if up >10% **and** moved more than $1 |
-| **Decrease** | Same logic, opposite direction | flagged if down >10% **and** moved more than $1 |
-| **Noise floor** | `max(today, prev, last_week)` | services below $1 are ignored entirely |
+### Rides
 
-A service appears in the report only if **at least one** check trips. If neither list has anything, the cron logs `No threshold crossings — skipping Slack post.` and exits.
+Ride counts come from ClickHouse. The SQL is **not in this repository** — it lives in a directory supplied at deploy time (`ride_query_dir`, a ConfigMap in Kubernetes), because the queries embed internal schema and "what counts as a ride" is a business definition that should change without a code change.
 
-## 🚀 Quick start (local)
+Each `*.sql` file is one ride source; the filename becomes its label (a numeric ordering prefix is stripped, so `10-rides.sql` reports as "rides"). Sources are reported separately and summed. A query without a `{day}` placeholder is refused rather than run unbounded, and if any source fails the ride metrics are dropped entirely rather than reporting an understated denominator.
 
-```bash
-git clone https://github.com/nammayatri/cloud-cost-anomaly
-cd cloud-cost-anomaly
-
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-cp config.example.json config.json
-# edit config.json: slack_bot_token, slack_channel_id, aws_profile
-
-python main.py --dry-run            # print Slack payload, don't send
-python main.py                      # post live
-python main.py --csv ./bill.csv --date 2026-05-15 --dry-run  # backtest
-```
+If ClickHouse is unreachable the run **degrades to cost-only** rather than failing — the cost data is worth sending on its own.
 
 ## ⚙️ Configuration
 
-All settings can come from **either** environment variables **or** `config.json`. Env wins. Same code path runs in dev and in-cluster.
+All settings come from **either** environment variables **or** `config.json`. Env wins. Same code path in dev and in-cluster.
 
 | Key (json) | Env var | Default | Notes |
 |---|---|---|---|
-| `provider` | `PROVIDER` | `aws` | `aws` or `gcp`. Also settable with `--provider`. |
-| `slack_bot_token` | `SLACK_BOT_TOKEN` | — | **Required.** `xoxb-…` with `chat:write` |
-| `slack_channel_id` | `SLACK_CHANNEL_ID` | — | **Required.** Prefer ID over `#name` (renames don't break things) |
-| `aws_profile` | `AWS_PROFILE` | — | AWS only, local only; IRSA is used in-cluster |
-| `aws_region` | `AWS_REGION` | `ap-south-1` | AWS only. Region for the Cost Explorer client |
-| `gcp_billing_table` | `GCP_BILLING_TABLE` | — | GCP only, **required.** `project.dataset.table` of the BigQuery billing export |
-| `gcp_project` | `GCP_PROJECT` | — | GCP only. Project that runs/bills the BigQuery job (defaults to ADC's) |
-| `gcp_projects` | `GCP_PROJECTS` | — | GCP only, **required.** Comma-separated projects to report on, in order. The export is billing-account-wide, so this scopes it. |
-| `currency` | `CURRENCY` | `USD`/`INR` | Display currency. Defaults from provider (AWS→USD, GCP→billing currency) |
-| `mention` | `MENTION` | empty | `here`, `channel`, a user ID (`U…`), or a usergroup ID (`S…`) |
-| `increase_pct_threshold` | `INCREASE_PCT_THRESHOLD` | `10` | Up-spike threshold (percent) |
-| `decrease_pct_threshold` | `DECREASE_PCT_THRESHOLD` | `10` | Down-drop threshold (percent) |
-| `abs_threshold` | `ABS_THRESHOLD` | `1` (USD) / `100` (INR) | Absolute-money guard so pennies don't fire (in the reporting currency) |
-| `noise_floor` | `NOISE_FLOOR` | `1` (USD) / `100` (INR) | Skip services entirely below this |
-| `lookback_days` | `LOOKBACK_DAYS` | `21` | Days of history to pull (≥ 8) |
-| `top_usage_types` | `TOP_USAGE_TYPES` | `3` | How many drill-down lines per service |
+| `provider` | `PROVIDER` | `all` | `aws`, `gcp`, or `all` (the combined workbook) |
+| `slack_bot_token` | `SLACK_BOT_TOKEN` | — | **Required.** `xoxb-…` with `chat:write` **and `files:write`** |
+| `slack_channel_id` | `SLACK_CHANNEL_ID` | — | **Required.** Prefer the ID over `#name` |
+| `aws_accounts` | `AWS_ACCOUNTS` | `[]` | **JSON array.** One tab per entry: `{"label", "role_arn"?, "profile"?, "region"?}`. Omit `role_arn` to use ambient credentials |
+| `aws_region` | `AWS_REGION` | `ap-south-1` | Default region for CE clients |
+| `gcp_billing_table` | `GCP_BILLING_TABLE` | — | **Required** for `gcp`/`all`. `project.dataset.table` |
+| `gcp_project` | `GCP_PROJECT` | — | Project that runs/bills the BigQuery job |
+| `gcp_projects` | `GCP_PROJECTS` | — | **Required** for `gcp`/`all`. Comma-separated, order preserved |
+| `gmp_billing_table` | `GMP_BILLING_TABLE` | — | Maps billing export. Omit to skip the GMP tab |
+| `gmp_projects` | `GMP_PROJECTS` | — | Comma-separated projects in the GMP billing account |
+| `report_currency` | `REPORT_CURRENCY` | `INR` | Everything is converted into this before any arithmetic |
+| `usd_inr_rate` | `USD_INR_RATE` | `88.0` | Pinned FX rate for AWS. Review it alongside the report |
+| `clickhouse_host` | `CLICKHOUSE_HOST` | — | Omit to skip ride metrics entirely |
+| `clickhouse_port` | `CLICKHOUSE_PORT` | `8123` | HTTP interface |
+| `clickhouse_user` / `_password` | `CLICKHOUSE_USER` / `_PASSWORD` | — | Needs `SELECT` on the ride table only |
+| `clickhouse_database` | `CLICKHOUSE_DATABASE` | `default` | Queries are fully qualified, so this rarely matters |
+| `ride_query_dir` | `RIDE_QUERY_DIR` | — | Directory of `*.sql` ride queries. Unset skips ride metrics |
+| `primary_ride_source` | `PRIMARY_RIDE_SOURCE` | first file | Which source is the base ride count; others are additive |
+| `monthly_budgets` | `MONTHLY_BUDGETS` | `{}` | JSON, per cloud (`AWS`/`GCP`/`GMP`), in the reporting currency |
+| `projection_days` | `PROJECTION_DAYS` | `30` | Days used for the run-rate projection |
+| `mention` | `MENTION` | empty | `here`, `channel`, user ID (`U…`), usergroup ID (`S…`) |
+| `xyne_base_url` | `XYNE_BASE_URL` | — | Optional second destination. All three Xyne keys must be set or it is skipped |
+| `xyne_jwt` | `XYNE_JWT` | — | App JWT. Needs `chat:write` and `files:write` |
+| `xyne_channel` | `XYNE_CHANNEL` | — | Channel **name without** a leading `#` |
+| `lookback_days` | `LOOKBACK_DAYS` | `21` | History pulled (must be ≥ 8 for the WoW column) |
 
 ## 🔐 IAM
 
@@ -152,13 +134,12 @@ gcloud iam service-accounts add-iam-policy-binding \
   --member "serviceAccount:<PROJECT>.svc.id.goog[<NAMESPACE>/cost-anomaly-cron]"
 ```
 
-> **Note on timing:** GCP restates billing rows for ~24–48h after the usage day. Schedule the GCP run late enough that yesterday's data has settled (the manifest in `k8s-gcp/` uses a later slot than the AWS one). The query is partition-pruned and typically scans well under a rupee's worth of BigQuery.
 
 ## 🚢 Deploy
 
 ```
 .
-├── k8s/                 # public-friendly manifests with <PLACEHOLDERS>
+├── k8s/                 # AWS manifests, public-friendly with <PLACEHOLDERS>
 └── prod/                # gitignored — your real values live here
 ```
 
@@ -201,28 +182,26 @@ Look for either a Slack post or `No threshold crossings — skipping Slack post.
 
 ## 🕐 When does it run?
 
-Default: `0 12 * * *` UTC. That's chosen because AWS Cost Explorer typically finalizes the previous day's billing data by **12:00 UTC**. Earlier than that and you risk reporting on partial numbers, which causes false anomaly alerts.
-
-## 🧪 Backtesting
-
-Got a CSV export from AWS Cost Explorer? Aim the detector at it without touching AWS:
-
-```bash
-python main.py --csv ~/Downloads/costs.csv --date 2026-05-15 --dry-run
-```
-
-Useful for tuning thresholds against your historical noise floor before you point it at live data.
+`0 17 * * *` in your business timezone. The report covers **T-2**, so by then every provider has finished restating that day — the numbers will not change afterwards.
 
 ## 🛠️ Architecture
 
 | File | Role |
 |---|---|
-| `main.py` | Entrypoint. Loads config, fetches, detects, drilldowns, posts. Skips post if nothing crosses. |
-| `fetch.py` | Two `ce:GetCostAndUsage` calls: by `SERVICE` (broad) and per-flagged `USAGE_TYPE` (deep). Carries `UsageQuantity` + unit. |
-| `detect.py` | Pure-function anomaly detection. Returns `(increases, decreases, summary)`. |
-| `drilldown.py` | Per-flagged-service usage-type ranker. Both dollar and quantity deltas. |
-| `slack.py` | Block Kit formatting + `chat.postMessage`. Main message + threaded breakdown. |
-| `config.py` | Env-overrides-json loader. Same code path local + prod. |
+| `main.py` | Entrypoint. Collect → build workbook → post. `--dry-run` builds and prints without posting. |
+| `collect.py` | Assembles every source into one cloud-agnostic report structure. Owns the T-2 target rule. |
+| `providers/__init__.py` | Provider registry **and the contract**: `scopes`, `fetch_by_service`, `currency`. |
+| `providers/aws.py` | Cost Explorer, **one CE client per account** via `sts:AssumeRole`. One tab per account. |
+| `providers/gcp.py` | BigQuery billing export. Serves both the infra and GMP exports — identical schema, different table. |
+| `rides.py` | ClickHouse ride counts over the HTTP interface, split by `cloud_type`. Degrades to `None` on failure. |
+| `money.py` | Single reporting currency + pinned FX. The only place that converts. |
+| `workbook.py` | XLSX builder: summary tab, per-account 7-day grids, GMP tab. |
+| `slack.py` | Root message + threaded replies + workbook upload. |
+| `xyne.py` | Second destination via a Slack-compatible adapter. Reuses `slack.py`'s tables and flattens them to text, so the two cannot drift. |
+| `config.py` | Env-overrides-json loader with validation. Same code path local + prod. |
+
+A **scope** is the unit each tab is built for: one AWS account, or one GCP project. `collect.py`, `workbook.py` and `slack.py` never learn which cloud a section came from.
+
 
 ## 🤝 Contributing
 

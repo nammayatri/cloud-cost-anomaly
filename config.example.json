@@ -1,18 +1,47 @@
 {
-  "provider": "aws",
-
-  "aws_profile": "prod",
-  "aws_region": "ap-south-1",
-
-  "gcp_billing_table": "my-project.billing_dataset.gcp_billing_export_resource_v1_XXXXXX",
-  "gcp_project": "my-gcp-project",
-  "gcp_projects": ["project-a", "project-b"],
-
+  "provider": "all",
+  "aws_region": "us-east-1",
+  "aws_accounts": [
+    {
+      "label": "Prod",
+      "region": "us-east-1"
+    },
+    {
+      "label": "Staging",
+      "region": "eu-west-1",
+      "role_arn": "arn:aws:iam::<ACCOUNT_ID>:role/cost-report-reader"
+    }
+  ],
+  "gcp_project": "<BQ_JOB_PROJECT>",
+  "gcp_billing_table": "<PROJECT>.<DATASET>.<BILLING_EXPORT_TABLE>",
+  "gcp_projects": [
+    "<PROJECT_A>",
+    "<PROJECT_B>"
+  ],
+  "gmp_billing_table": "<MAPS_PROJECT>.<MAPS_DATASET>.<MAPS_EXPORT_TABLE>",
+  "gmp_projects": [
+    "<MAPS_PROJECT>"
+  ],
+  "report_currency": "INR",
+  "usd_inr_rate": 88.0,
+  "ride_query_dir": "/etc/cost-report/queries",
+  "primary_ride_source": "rides",
+  "clickhouse_host": "<HOST>",
+  "clickhouse_port": 8123,
+  "clickhouse_user": "<USER>",
+  "clickhouse_password": "<PASSWORD>",
+  "clickhouse_database": "default",
+  "monthly_budgets": {
+    "AWS": 0,
+    "GCP": 0,
+    "GMP": 0
+  },
+  "projection_days": 30,
   "slack_bot_token": "xoxb-...",
   "slack_channel_id": "C0XXXXXXXXX",
   "mention": "",
-  "increase_pct_threshold": 8,
-  "decrease_pct_threshold": 5,
   "lookback_days": 21,
-  "top_usage_types": 3
+  "xyne_base_url": "https://<xyne-host>",
+  "xyne_jwt": "<app jwt from install/regenerate-jwt>",
+  "xyne_channel": "<channel-name-without-hash>"
 }

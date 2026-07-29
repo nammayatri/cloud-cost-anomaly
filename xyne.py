@@ -1,0 +1,188 @@
+"""Xyne delivery, via the Slack-compatible adapter at /api/apps/slack/*.
+
+Xyne exposes Slack-shaped routes but a narrower message model: `chat.postMessage`
+takes `channel`, `text` and `mrkdwn` — there is no `blocks` and no `attachments`,
+so the coloured side-bar the Slack transport uses has no equivalent here.
+
+Rather than maintain a second copy of every table, this module RENDERS THE SAME
+BLOCKS the Slack transport builds and flattens them to text. The two channels
+therefore cannot drift: a change to a table shows up in both, or in neither.
+
+Threading works: `thread_ts` nests the reply correctly, even though the response
+object does not echo the field back. The reply structure therefore mirrors Slack's
+exactly — one root, everything else in the thread.
+"""
+
+import json
+import logging
+import mimetypes
+import urllib.request
+import uuid
+from pathlib import Path
+
+import slack
+
+log = logging.getLogger("cost-anomaly.xyne")
+
+_TIMEOUT = 60
+
+
+def configured(cfg: dict) -> bool:
+    return bool(cfg.get("xyne_base_url") and cfg.get("xyne_jwt") and cfg.get("xyne_channel"))
+
+
+def _api(cfg: dict, method: str, payload: dict) -> dict:
+    req = urllib.request.Request(
+        cfg["xyne_base_url"].rstrip("/") + "/api/apps/slack/" + method,
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": "Bearer " + cfg["xyne_jwt"],
+                 "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
+        # The API echoes raw newlines inside JSON strings, which a strict parser
+        # rejects. strict=False accepts the literal control characters.
+        return json.loads(r.read().decode("utf-8", "replace"), strict=False)
+
+
+# Slack renders :shortcode: emoji server-side; there is no guarantee Xyne does,
+# and an unrendered ":red_circle:" in the headline is worse than no emoji at all.
+# Substituting the literal character sidesteps the question.
+_EMOJI = {
+    ":red_circle:": "\U0001F534",
+    ":large_yellow_circle:": "\U0001F7E1",
+    ":large_green_circle:": "\U0001F7E2",
+    ":white_circle:": "\u26AA",
+    ":rotating_light:": "\U0001F6A8",
+    ":warning:": "\u26A0\uFE0F",
+}
+
+
+def _demojize(text: str) -> str:
+    for code, char in _EMOJI.items():
+        text = text.replace(code, char)
+    return text
+
+
+def _blocks_to_text(blocks: list[dict]) -> str:
+    """Flatten Block Kit into the plain markdown Xyne accepts."""
+    parts = []
+    for b in blocks or []:
+        if b.get("type") == "divider":
+            continue
+        t = b.get("text", {}).get("text")
+        if not t and b.get("type") == "context":
+            t = " ".join(e.get("text", "") for e in b.get("elements", []))
+        if not t and b.get("type") == "header":
+            t = "*" + b.get("text", {}).get("text", "") + "*"
+        if t:
+            parts.append(t)
+    return _demojize("\n".join(parts).strip())
+
+
+def _post(cfg: dict, text: str, thread_ts: str | None = None) -> dict | None:
+    if not text:
+        return None
+    payload = {"channel": cfg["xyne_channel"], "text": text, "mrkdwn": True}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    try:
+        resp = _api(cfg, "chat.postMessage", payload)
+    except Exception as e:
+        log.error("Xyne post failed: %s", e)
+        return None
+    if not resp.get("ok"):
+        # Slack-shaped errors come back HTTP 200 with ok:false, so this has to be
+        # checked explicitly or every failure looks like a success.
+        log.error("Xyne rejected the message: %s", resp.get("error"))
+        return None
+    return resp
+
+
+def _upload(cfg: dict, path: str, thread_ts: str | None = None) -> bool:
+    """Attach the workbook via files.upload (multipart)."""
+    p = Path(path)
+    boundary = "----costreport" + uuid.uuid4().hex
+    ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+
+    def part(name, value):
+        return (f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n").encode()
+
+    body = bytearray()
+    body += part("channels", cfg["xyne_channel"])
+    body += part("initial_comment", "Full per-service breakdown, 7 days per account.")
+    if thread_ts:
+        body += part("thread_ts", thread_ts)
+    body += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+             f'filename="{p.name}"\r\nContent-Type: {ctype}\r\n\r\n').encode()
+    body += p.read_bytes()
+    body += f"\r\n--{boundary}--\r\n".encode()
+
+    req = urllib.request.Request(
+        cfg["xyne_base_url"].rstrip("/") + "/api/apps/slack/files.upload",
+        data=bytes(body),
+        headers={"Authorization": "Bearer " + cfg["xyne_jwt"],
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
+            resp = json.loads(r.read().decode("utf-8", "replace"), strict=False)
+    except Exception as e:
+        log.error("Xyne file upload failed: %s", e)
+        return False
+    if not resp.get("ok"):
+        log.error("Xyne rejected the upload: %s", resp.get("error"))
+        return False
+    return True
+
+
+def post(cfg: dict, report: dict, xlsx_path: str) -> None:
+    """Same content as the Slack report, flattened for Xyne's text-only messages."""
+    if not configured(cfg):
+        log.info("Xyne not configured — skipping")
+        return
+
+    top, attachments = slack.build_root_blocks(cfg, report)
+
+    # build_root_blocks already emits a mention block in Slack's own syntax
+    # (<!here>). Drop it before flattening, then re-add the plain form — otherwise
+    # the mention appears twice, once in each syntax.
+    mention = cfg.get("mention", "")
+    slack_mention = slack._mention_text(mention)
+    blocks = [b for b in top
+              if b.get("text", {}).get("text") != slack_mention] + attachments[0]["blocks"]
+    root_text = _blocks_to_text(blocks)
+
+    if mention:
+        # Xyne's mention syntax is unverified, so the plain form is used: at worst
+        # it renders as literal text, whereas Slack's <!here> would render as a
+        # broken token if unsupported.
+        root_text = f"@{mention.lstrip('@')}\n{root_text}"
+
+    root = _post(cfg, root_text)
+    if root is None:
+        log.error("Xyne root message failed — skipping the rest of the report")
+        return
+    ts = root.get("ts")
+
+    clouds = {s["cloud"] for s in report["sections"] if s["cloud"] != "GMP"}
+    replies = [
+        slack._account_split_blocks(cfg, report, clouds, "*Cloud — account split*"),
+        slack._account_split_blocks(cfg, report, {"GMP"}, "*Maps — account split*")
+        + slack._gmp_table_blocks(cfg, report),
+        slack._runrate_blocks(cfg, report),
+        slack._per_ride_blocks(cfg, report),
+    ]
+    for section in sorted(report["sections"], key=lambda x: x["total_report"], reverse=True):
+        if section["cloud"] == "GMP":
+            continue
+        replies.append(slack._section_table_blocks(cfg, report, section))
+    replies.append(slack._movers_blocks(cfg, report))
+
+    for blocks in replies:
+        _post(cfg, _blocks_to_text(blocks), thread_ts=ts)
+
+    if _upload(cfg, xlsx_path, thread_ts=ts):
+        log.info("Posted report and workbook to Xyne channel %s", cfg["xyne_channel"])
+    else:
+        log.warning("Xyne report posted but the workbook upload failed")

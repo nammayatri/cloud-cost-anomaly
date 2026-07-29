@@ -1,6 +1,6 @@
 """Cloud cost providers.
 
-A provider supplies daily cost data in a cloud-agnostic shape so that detect.py
+A provider supplies daily cost data in a cloud-agnostic shape so that collect.py
 and slack.py never need to know which cloud they're looking at.
 
 Contract
@@ -13,10 +13,6 @@ scopes(cfg) -> list[str]
 fetch_by_service(cfg, end) -> dict[scope, DataFrame]
     Per scope: a DataFrame indexed by date, one column per service, plus 'Total'.
     Covers the trailing cfg['lookback_days'], ending at `end` (exclusive).
-
-fetch_usage_types(cfg, scope, service, end, days) -> (cost_df, qty_df, units)
-    Per-scope drill-down for one service, broken down by usage type
-    (AWS USAGE_TYPE / GCP SKU), carrying both cost and usage quantity.
 
 currency(cfg) -> str
     ISO code the provider reports in. Drives money formatting in slack.py.
