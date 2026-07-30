@@ -23,18 +23,32 @@ log = logging.getLogger("cost-anomaly.slack")
 _MAX_BLOCK = 2800
 
 
-def _mention_text(mention: str) -> str:
-    """Slack mention syntax. Supports 'here', 'channel', user IDs (U…), group IDs (S…)."""
-    if not mention:
+def _mention_one(m: str) -> str:
+    m = m.strip().lstrip("@")
+    if not m:
         return ""
-    m = mention.strip().lstrip("@")
     if m in ("here", "channel", "everyone"):
         return f"<!{m}>"
     if m.startswith(("U", "W")):
         return f"<@{m}>"
     if m.startswith("S"):
         return f"<!subteam^{m}>"
+    # Anything else passes through as literal text. Slack only NOTIFIES on an ID —
+    # a bare "@name" renders as grey text and pings nobody — so a plain name here
+    # is a display label, not an alert.
     return m
+
+
+def _mention_text(mention: str) -> str:
+    """Slack mention syntax for one or more comma-separated targets.
+
+    Accepts 'here', 'channel', user IDs (U…/W…) and usergroup IDs (S…), e.g.
+    "here,U06LTP1MEH5,U06LTPY08S3". Handling the list here rather than at the call
+    site means a multi-target MENTION cannot silently degrade into literal text.
+    """
+    if not mention:
+        return ""
+    return " ".join(filter(None, (_mention_one(m) for m in mention.split(","))))
 
 
 def _num(v: float, decimals: int = 2) -> str:
@@ -151,14 +165,11 @@ def build_root_blocks(cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
     budgets = cfg.get("monthly_budgets") or {}
     days = int(cfg.get("projection_days") or 30)
 
-    top_blocks: list[dict] = []
     mention = _mention_text(cfg.get("mention", ""))
-    if mention:
-        top_blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": mention}})
-    top_blocks.append({
+    top_blocks: list[dict] = [{
         "type": "header",
         "text": {"type": "plain_text", "text": f"Cloud Costs On {d.isoformat()}", "emoji": True},
-    })
+    }]
 
     cloud_total = sum(v for c, v in t["by_cloud"].items() if c != "GMP")
     maps_total = t["by_cloud"].get("GMP", 0.0)
@@ -209,6 +220,12 @@ def build_root_blocks(cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
     body.append({"type": "section", "text": {"type": "mrkdwn",
         "text": "```\n" + _mono_table(["Account", "Current", "Goal/day", "Rate"], rows)
                 + "\n```"}})
+
+    # Mentions last: the numbers are what the reader came for, and a row of pings
+    # above them is just a wall to scroll past. Position has no effect on whether
+    # Slack notifies — an ID pings from anywhere in the message.
+    if mention:
+        body.append({"type": "section", "text": {"type": "mrkdwn", "text": mention}})
     return top_blocks, [{"color": _root_color(cfg, report), "blocks": body}]
 
 

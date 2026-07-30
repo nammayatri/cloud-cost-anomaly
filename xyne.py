@@ -144,20 +144,19 @@ def post(cfg: dict, report: dict, xlsx_path: str) -> None:
 
     top, attachments = slack.build_root_blocks(cfg, report)
 
-    # build_root_blocks already emits a mention block in Slack's own syntax
-    # (<!here>). Drop it before flattening, then re-add the plain form — otherwise
-    # the mention appears twice, once in each syntax.
-    mention = cfg.get("mention", "")
-    slack_mention = slack._mention_text(mention)
-    blocks = [b for b in top
-              if b.get("text", {}).get("text") != slack_mention] + attachments[0]["blocks"]
+    # Strip Slack's own mention block wherever it sits — it lives at the end of the
+    # body, and its <@U…> tokens are Slack-workspace IDs that resolve to nothing in
+    # Xyne. Scanning both lists keeps this correct if the block ever moves again.
+    slack_mention = slack._mention_text(cfg.get("mention", ""))
+    blocks = [b for b in (top + attachments[0]["blocks"])
+              if b.get("text", {}).get("text") != slack_mention]
     root_text = _blocks_to_text(blocks)
 
-    if mention:
-        # Xyne's mention syntax is unverified, so the plain form is used: at worst
-        # it renders as literal text, whereas Slack's <!here> would render as a
-        # broken token if unsupported.
-        root_text = f"@{mention.lstrip('@')}\n{root_text}"
+    # Xyne has its own directory and its own ID scheme (cuid2, not Slack's U…), so
+    # `xyne_mention` is a separate literal string. Appended, matching Slack.
+    xm = (cfg.get("xyne_mention") or "").strip()
+    if xm:
+        root_text = f"{root_text}\n{xm}"
 
     root = _post(cfg, root_text)
     if root is None:
