@@ -73,6 +73,10 @@ _DEFAULTS = {
     # used when the fetch fails, so the run still completes with a known number.
     "fx_fetch": True,
     "fx_api_url": "https://api.frankfurter.app/{date}?from=USD&to=INR",
+    # currencyapi.net key. When set, it is the primary live FX source
+    # (frankfurter is the date-specific fallback).
+    "fx_currencyapi_key": None,
+    "fx_currencyapi_url": "https://currencyapi.net/api/v2/rates",
     "usd_inr_rate": 88.0,
 
     "slack_bot_token": None,
@@ -84,6 +88,34 @@ _DEFAULTS = {
     "xyne_base_url": None,
     "xyne_jwt": None,
     "xyne_channel": None,
+    # Literal mention string prepended nowhere — appended to the Xyne root message.
+    # Xyne has its own directory, so Slack user/group IDs do not carry over.
+    "xyne_mention": None,
+
+    # --- Cost store (ClickHouse cost_analytics.cost_daily) ---
+    # Optional. When set, each run persists the day's per-service cost for the
+    # Control Center. Dedicated write-scoped user, separate from ride-count reads.
+    "cost_ch_host": None,
+    "cost_ch_port": 8123,
+    "cost_ch_user": None,
+    "cost_ch_password": None,
+    "cost_ch_database": "cost_analytics",
+    "cost_ch_table": "cost_daily",
+    "cost_ch_secure": False,
+
+    # --- Third-party vendor daily cost (optional) ---
+    # A billing source with no machine credential: authenticated by a session
+    # token pasted into the secret and refreshed periodically. Everything vendor-
+    # specific (endpoint, token, labels) is supplied here, never hardcoded.
+    "vendor_api_url": None,
+    "vendor_origin": None,               # request Origin header, if the API needs it
+    "vendor_client_id": None,
+    "vendor_refresh_token": None,        # session token; refresh in the secret as needed
+    "vendor_current_credentials": None,
+    "vendor_account_label": "Vendor",    # account-column label
+    "vendor_type": "Data and Tools",     # `type` grouping for these rows
+    "vendor_cost_head": "Vendor",
+
     "lookback_days": 21,
     "mention": "",
 }
@@ -92,6 +124,7 @@ _CAST = {
     "usd_inr_rate": float,
     "lookback_days": int,
     "clickhouse_port": int,
+    "cost_ch_port": int,
     "projection_days": int,
 }
 
@@ -101,7 +134,7 @@ _LIST_KEYS = ("gcp_projects", "gmp_projects")
 # Env vars that carry structured data, as a JSON string.
 _JSON_KEYS = ("aws_accounts", "monthly_budgets")
 
-_BOOL_KEYS = ("clickhouse_secure", "fx_fetch")
+_BOOL_KEYS = ("clickhouse_secure", "fx_fetch", "cost_ch_secure")
 
 _TRUTHY = {"1", "true", "yes", "on"}
 

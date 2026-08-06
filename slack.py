@@ -43,7 +43,7 @@ def _mention_text(mention: str) -> str:
     """Slack mention syntax for one or more comma-separated targets.
 
     Accepts 'here', 'channel', user IDs (U…/W…) and usergroup IDs (S…), e.g.
-    "here,U06LTP1MEH5,U06LTPY08S3". Handling the list here rather than at the call
+    "here,U01234567,U08234567". Handling the list here rather than at the call
     site means a multi-target MENTION cannot silently degrade into literal text.
     """
     if not mention:
@@ -171,21 +171,29 @@ def build_root_blocks(cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
         "text": {"type": "plain_text", "text": f"Cloud Costs On {d.isoformat()}", "emoji": True},
     }]
 
-    cloud_total = sum(v for c, v in t["by_cloud"].items() if c != "GMP")
+    # "Cloud" = the infrastructure clouds (AWS + GCP). Maps and the third-party
+    # vendor are their own named buckets, each shown as a single total line, and
+    # all three roll into the grand total. The vendor's display name is config.
+    _NAMED = {"GMP", "VENDOR"}
+    vendor_label = cfg.get("vendor_cost_head") or "Vendor"
+    cloud_total = sum(v for c, v in t["by_cloud"].items() if c not in _NAMED)
     maps_total = t["by_cloud"].get("GMP", 0.0)
-    cloud_budget = sum(v for c, v in budgets.items() if c != "GMP" and v)
-    maps_budget = budgets.get("GMP") or 0
+    vendor_total = t["by_cloud"].get("VENDOR", 0.0)
+    cloud_budget = sum(v for c, v in budgets.items() if c not in _NAMED and v)
 
     entries = []
     for cloud in _cloud_order(report):
-        if cloud == "GMP":
+        if cloud in _NAMED:
             continue
         entries.append((f"{_cloud_name(cloud)} All Accounts", t["by_cloud"][cloud],
                         budgets.get(cloud)))
     if maps_total:
-        entries.append(("Maps Total", maps_total, maps_budget or None))
-    entries.append(("Cloud + Maps Total", cloud_total + maps_total,
-                    (cloud_budget + maps_budget) or None))
+        entries.append(("Maps Total", maps_total, (budgets.get("GMP") or None)))
+    if vendor_total:
+        entries.append((f"{vendor_label} Total", vendor_total, (budgets.get("VENDOR") or None)))
+    grand = cloud_total + maps_total + vendor_total
+    entries.append(("Total", grand,
+                    (cloud_budget + (budgets.get("GMP") or 0) + (budgets.get("VENDOR") or 0)) or None))
 
     # The goal is shown as a DAILY figure (monthly budget / projection days) so it
     # sits in the same units as the cost beside it. Comparing a day's spend to a
@@ -419,11 +427,16 @@ def post(cfg: dict, report: dict, xlsx_path: str) -> None:
             client.chat_postMessage(channel=channel, thread_ts=ts, text=fallback,
                                     blocks=blocks, unfurl_links=False, unfurl_media=False)
 
-    clouds = {s["cloud"] for s in report["sections"] if s["cloud"] != "GMP"}
+    infra = {s["cloud"] for s in report["sections"] if s["cloud"] not in ("GMP", "HV")}
 
     # 1 — account split of the infrastructure clouds
-    reply(_account_split_blocks(cfg, report, clouds, "*Cloud — account split*"),
+    reply(_account_split_blocks(cfg, report, infra, "*Cloud — account split*"),
           "Cloud account split")
+
+    # 1b — third-party vendor: one line item, split by module (per-service table)
+    vend = next((sec for sec in report["sections"] if sec["cloud"] == "VENDOR"), None)
+    if vend:
+        reply(_section_table_blocks(cfg, report, vend), "Vendor by module")
 
     # 2 — Maps: project split plus the per-API request volumes
     maps_blocks = _account_split_blocks(cfg, report, {"GMP"}, "*Maps — account split*")
@@ -438,8 +451,8 @@ def post(cfg: dict, report: dict, xlsx_path: str) -> None:
 
     # Detail: per-service tables, then the biggest movers.
     for section in sorted(report["sections"], key=lambda x: x["total_report"], reverse=True):
-        if section["cloud"] == "GMP":
-            continue          # already covered by the per-API table above
+        if section["cloud"] in ("GMP", "VENDOR"):
+            continue          # GMP via the per-API table, vendor via the by-module reply
         reply(_section_table_blocks(cfg, report, section), f"{section['label']} breakdown")
     reply(_movers_blocks(cfg, report), "Biggest increases")
 

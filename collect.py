@@ -15,6 +15,8 @@ day of latency buys numbers that don't move after the fact.
 import logging
 from datetime import date, timedelta
 
+import pandas as pd
+
 import money
 import providers
 import rides as rides_mod
@@ -142,6 +144,39 @@ def _gcp_sections(cfg, target, source, cloud, label_prefix):
     return out
 
 
+def _vendor_section(cfg, target):
+    """The third-party vendor as a report section: one account, one row per module
+    across the 7-day window.
+
+    The vendor API is single-day, so the window is assembled with one call per day
+    (target-7 .. target — the WoW baseline needs day-7). Any failure (an expired
+    session token being the usual one) drops the vendor from the live report rather
+    than failing the run — the ClickHouse store is the durable record, this is
+    best-effort presentation.
+    """
+    import vendor_billing
+    if not vendor_billing.configured(cfg):
+        return []
+    label = cfg.get("vendor_account_label") or "Vendor"
+    window = [target - timedelta(days=i) for i in range(WINDOW_DAYS)] + [target - timedelta(days=7)]
+    per_day = {}
+    try:
+        for d in sorted(set(window)):
+            per_day[d] = {r["service"]: r["cost"] for r in vendor_billing.fetch_day(cfg, d)}
+    except Exception as e:
+        log.error("Vendor billing fetch failed — omitting from the live report: %s", e)
+        return []
+    if not per_day.get(target):
+        return []
+
+    services = sorted({s for day in per_day.values() for s in day})
+    rows_by_day = [{s: per_day.get(d, {}).get(s, 0.0) for s in services}
+                   for d in sorted(per_day)]
+    df = pd.DataFrame(rows_by_day, index=sorted(per_day))
+    df["Total"] = df.sum(axis=1)
+    return [_build_section(cfg, label, "VENDOR", cfg["report_currency"], df, target)]
+
+
 def collect(cfg: dict, target: date | None = None) -> dict:
     target = target or default_target()
     log.info("Building report for %s (T-2)", target)
@@ -160,6 +195,7 @@ def collect(cfg: dict, target: date | None = None) -> dict:
     if want in ("gcp", "all"):
         sections += _gcp_sections(cfg, target, "gcp", "GCP", "GCP ")
         sections += _gcp_sections(cfg, target, "gmp", "GMP", "GMP ")
+        sections += _vendor_section(cfg, target)
 
     if not sections:
         raise RuntimeError(f"No cost data available for {target} from any provider")
@@ -262,7 +298,7 @@ def unit_economics(cfg: dict, report: dict) -> list[dict]:
     incl = f"incl {', '.join(others)}" if others else None
     both = bool(incl) and total_rides != rides_only
 
-    cloud = sum(v for c, v in t["by_cloud"].items() if c != "GMP")
+    cloud = sum(v for c, v in t["by_cloud"].items() if c not in ("GMP", "VENDOR"))
     maps = t["by_cloud"].get("GMP", 0.0)
 
     rows = []

@@ -41,12 +41,13 @@ def resolve_rate(cfg: dict, target) -> None:
         cfg["fx_source"] = f"pinned ({cfg['usd_inr_rate']:g})"
         return
 
+    # FX source chain, tried in order — each is a fallback for the one before, so
+    # a single provider being down never forces the stale pinned rate:
+    #   1. Frankfurter, for the TARGET day (date-specific → most correct, keyless).
+    #   2. currencyapi.net live (keyed, reliable) — recent rate, close enough for a
+    #      T-2 report when frankfurter is unavailable.
+    #   3. The pinned usd_inr_rate.
     url = cfg.get("fx_api_url") or "https://api.frankfurter.app/{date}?from=USD&to=INR"
-
-    # Retry before giving up. Falling back is not free: it silently reports the
-    # same day's spend at a different exchange rate, so two runs of the same date
-    # can disagree by several percent. A transient timeout should not be enough to
-    # cause that.
     last_err = None
     for attempt in range(_FX_ATTEMPTS):
         try:
@@ -59,15 +60,32 @@ def resolve_rate(cfg: dict, target) -> None:
             if not 50.0 <= fetched <= 200.0:
                 raise ValueError(f"implausible USD/INR rate {fetched}")
             cfg["usd_inr_rate"] = fetched
-            cfg["fx_source"] = f"fetched @ {data.get('date', target.isoformat())}"
+            cfg["fx_source"] = f"frankfurter @ {data.get('date', target.isoformat())}"
             log.info("USD/INR for %s = %.4f (%s)", target, fetched, cfg["fx_source"])
             return
         except Exception as e:
             last_err = e
             if attempt + 1 < _FX_ATTEMPTS:
-                log.warning("FX fetch attempt %d/%d failed (%s); retrying",
+                log.warning("frankfurter attempt %d/%d failed (%s); retrying",
                             attempt + 1, _FX_ATTEMPTS, e)
                 time.sleep(_FX_BACKOFF * (attempt + 1))
+
+    key = cfg.get("fx_currencyapi_key")
+    if key:
+        try:
+            resp = requests.get(cfg.get("fx_currencyapi_url") or "https://currencyapi.net/api/v2/rates",
+                                params={"key": key, "base": "USD", "output": "json"},
+                                headers={"Accept": "application/json"}, timeout=_FX_TIMEOUT)
+            resp.raise_for_status()
+            fetched = float(resp.json()["rates"]["INR"])
+            if not 50.0 <= fetched <= 200.0:
+                raise ValueError(f"implausible USD/INR rate {fetched}")
+            cfg["usd_inr_rate"] = fetched
+            cfg["fx_source"] = "currencyapi.net (live)"
+            log.info("USD/INR = %.4f (currencyapi.net live; frankfurter unavailable)", fetched)
+            return
+        except Exception as e:
+            log.warning("currencyapi.net FX also failed (%s)", e)
 
     cfg["fx_source"] = f"pinned fallback ({cfg['usd_inr_rate']:g}) — fetch failed"
     log.warning("FX fetch failed after %d attempts (%s); using pinned rate %g — "

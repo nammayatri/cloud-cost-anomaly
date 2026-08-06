@@ -147,22 +147,27 @@ def _summary_sheet(wb, styles, taken, cfg, report):
     r = 3
     budgets = cfg.get("monthly_budgets") or {}
     days = int(cfg.get("projection_days") or 30)
-    cloud_total = sum(v for c, v in t["by_cloud"].items() if c != "GMP")
+    _NAMED = {"GMP", "VENDOR"}
+    cloud_total = sum(v for c, v in t["by_cloud"].items() if c not in _NAMED)
     maps_total = t["by_cloud"].get("GMP", 0.0)
-    cloud_budget = sum(v for c, v in budgets.items() if c != "GMP" and v)
+    vendor_total = t["by_cloud"].get("VENDOR", 0.0)
+    cloud_budget = sum(v for c, v in budgets.items() if c not in _NAMED and v)
     maps_budget = budgets.get("GMP") or 0
 
     entries = []
     for cloud, val in sorted(t["by_cloud"].items(), key=lambda kv: kv[1], reverse=True):
-        if cloud == "GMP":
+        if cloud in _NAMED:
             continue
         entries.append((f"{collect.cloud_name(cloud)} All Accounts", val, budgets.get(cloud)))
     if maps_total:
         entries.append(("Maps Total", maps_total, maps_budget or None))
-    entries.append(("Cloud + Maps Total", cloud_total + maps_total,
-                    (cloud_budget + maps_budget) or None))
+    if vendor_total:
+        entries.append((f"{cfg.get('vendor_cost_head') or 'Vendor'} Total", vendor_total,
+                        (budgets.get("VENDOR") or None)))
+    entries.append(("Total", cloud_total + maps_total + vendor_total,
+                    (cloud_budget + maps_budget + (budgets.get("VENDOR") or 0)) or None))
 
-    # Same four lines as the Slack root, so the two can be read against each other.
+    # Mirrors the Slack root exactly, so the two can be read against each other.
     ws.write_row(r, 0, ["Account", f"Current ({rc})", f"Goal/day ({rc})", "Rate"], styles.header)
     r += 1
     for label, val, budget in entries:

@@ -9,6 +9,7 @@ import collect as collector
 import config as config_loader
 import money
 import slack
+import store
 import workbook
 import xyne
 
@@ -35,6 +36,15 @@ def run(dry_run: bool = False, target: date | None = None, provider_name: str | 
 
     workbook.build(path, cfg, report)
     log.info("Workbook written to %s", path)
+
+    # Persist to the Control-Center store. Fully isolated: write_report already
+    # swallows its own errors, and this outer guard means even an unexpected one
+    # (or a vendor session-token expiry) can never lose a run that otherwise
+    # built the report and is about to deliver it.
+    try:
+        store.write_report(cfg, report)
+    except Exception as e:
+        log.error("Cost store write failed (continuing): %s", e)
 
     if dry_run or no_post:
         _print_summary(cfg, report, path)
@@ -90,7 +100,20 @@ def main():
                     help="Build the workbook and print the summary, but don't post to Slack")
     ap.add_argument("--out", help="Write the workbook to this path instead of a temp dir")
     ap.add_argument("--date", help="Target date (YYYY-MM-DD). Default: T-2 (day before yesterday)")
+    ap.add_argument("--backfill", type=int, metavar="N",
+                    help="Populate the cost store for the last N days ending at the target "
+                         "day (inclusive), then exit. No Slack post.")
     args = ap.parse_args()
+
+    if args.backfill:
+        cfg = config_loader.load(provider=args.provider)
+        end = (date.fromisoformat(args.date) if args.date else collector.default_target()) \
+            + __import__("datetime").timedelta(days=1)          # exclusive
+        start = end - __import__("datetime").timedelta(days=args.backfill)
+        counts = store.backfill(cfg, start, end)
+        print(f"Backfilled {start}..{end - __import__('datetime').timedelta(days=1)} "
+              f"(inclusive): {counts}")
+        sys.exit(0)
 
     target = date.fromisoformat(args.date) if args.date else None
     sys.exit(run(dry_run=args.dry_run, target=target, provider_name=args.provider,

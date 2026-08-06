@@ -164,16 +164,18 @@ def post(cfg: dict, report: dict, xlsx_path: str) -> None:
         return
     ts = root.get("ts")
 
-    clouds = {s["cloud"] for s in report["sections"] if s["cloud"] != "GMP"}
+    infra = {s["cloud"] for s in report["sections"] if s["cloud"] not in ("GMP", "VENDOR")}
+    vend = next((s for s in report["sections"] if s["cloud"] == "VENDOR"), None)
     replies = [
-        slack._account_split_blocks(cfg, report, clouds, "*Cloud — account split*"),
+        slack._account_split_blocks(cfg, report, infra, "*Cloud — account split*"),
+        slack._section_table_blocks(cfg, report, vend) if vend else [],
         slack._account_split_blocks(cfg, report, {"GMP"}, "*Maps — account split*")
         + slack._gmp_table_blocks(cfg, report),
         slack._runrate_blocks(cfg, report),
         slack._per_ride_blocks(cfg, report),
     ]
     for section in sorted(report["sections"], key=lambda x: x["total_report"], reverse=True):
-        if section["cloud"] == "GMP":
+        if section["cloud"] in ("GMP", "VENDOR"):
             continue
         replies.append(slack._section_table_blocks(cfg, report, section))
     replies.append(slack._movers_blocks(cfg, report))

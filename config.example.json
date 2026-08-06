@@ -43,5 +43,19 @@
   "lookback_days": 21,
   "xyne_base_url": "https://<xyne-host>",
   "xyne_jwt": "<app jwt from install/regenerate-jwt>",
-  "xyne_channel": "<channel-name-without-hash>"
+  "xyne_channel": "<channel-name-without-hash>",
+  "cost_ch_host": "<clickhouse-host>",
+  "cost_ch_user": "<writer-user>",
+  "cost_ch_password": "<writer-pass>",
+  "cost_ch_database": "cost_analytics",
+  "cost_ch_table": "cost_daily",
+  "fx_currencyapi_key": "<currencyapi-net-key-optional>",
+  "vendor_api_url": "<vendor-billing-endpoint>",
+  "vendor_origin": "<vendor-dashboard-origin>",
+  "vendor_client_id": "<vendor-client-id>",
+  "vendor_refresh_token": "<48h-session-token-refresh-every-48h>",
+  "vendor_current_credentials": "<vendor-session-context-optional>",
+  "vendor_account_label": "Vendor",
+  "vendor_type": "Data and Tools",
+  "vendor_cost_head": "Vendor"
 }
