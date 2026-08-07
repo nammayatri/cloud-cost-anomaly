@@ -12,9 +12,11 @@ the digits line up — proportional text turns a cost column into noise.
 import logging
 import re
 import tempfile
+import time
 from pathlib import Path
 
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 import collect
 import image_render
@@ -576,68 +578,71 @@ def render_images(cfg: dict, report: dict, tmpdir: str) -> list[tuple[str, str]]
     return out
 
 
-def _first_share_ts(resp) -> str | None:
-    """Pull the posted message ts out of a files_upload_v2 response, so the rest of
-    the report threads under the summary image. The shares map is keyed by channel
-    id (not the '#name' we may have sent), so take the first ts found."""
-    try:
-        files = resp.get("files") or ([resp["file"]] if resp.get("file") else [])
-        for f in files:
-            for vis in ((f or {}).get("shares") or {}).values():
-                for arr in vis.values():
-                    if arr and arr[0].get("ts"):
-                        return arr[0]["ts"]
-    except Exception:
-        pass
-    return None
+def _upload_id(client: WebClient, path: str, title: str, filename: str) -> str:
+    """Upload a file WITHOUT sharing it to a channel and return its file id, to be
+    referenced from an image block. A raw channel upload can't be threaded under
+    (Slack returns empty `shares`); an image block in a real message can."""
+    resp = client.files_upload_v2(file=path, filename=filename, title=title)
+    f = resp.get("file") or (resp.get("files") or [{}])[0]
+    return f["id"]
+
+
+def _image_block(file_id: str, alt: str) -> dict:
+    return {"type": "image", "slack_file": {"id": file_id}, "alt_text": alt}
+
+
+def _post_blocks(client: WebClient, *, retries: int = 6, **kwargs):
+    """chat.postMessage with a retry for `invalid_blocks`. A file referenced by an
+    image block is not usable for a second or two after upload; Slack rejects the
+    block until it is, so back off and retry rather than dropping the message."""
+    for i in range(retries):
+        try:
+            return client.chat_postMessage(**kwargs)
+        except SlackApiError as e:
+            if e.response.get("error") == "invalid_blocks" and i < retries - 1:
+                time.sleep(1.5)
+                continue
+            raise
 
 
 def post(cfg: dict, report: dict, xlsx_path: str) -> None:
-    """The summary card as the root image, every breakdown as a threaded image,
-    then the workbook. Same tables as the text report — rendered for a phone."""
+    """The summary card + mentions ARE the root message; every breakdown threads
+    under it, then the workbook. Each image posts as an inline image block in a real
+    message — that yields a reliable message ts to thread under (a raw file upload
+    does not). Works with a channel #name or id."""
     client = WebClient(token=cfg["slack_bot_token"])
     d = report["date"]
     channel = cfg["slack_channel_id"]
     tmp = tempfile.mkdtemp(prefix="cost-img-")
     images = render_images(cfg, report, tmp)          # summary first
     mention = _mention_text(cfg.get("mention", ""))
-    headline = f"*Cloud costs — {d.isoformat()}*"
-    _, summary_png = images[0]
 
-    # The summary card IS the root message. files_upload_v2 needs a channel id
-    # (^[CGDZ]…); prod stores one, so the image posts straight into the channel. If
-    # only a #name is available we can't upload to it directly, so we open a text
-    # root (which also resolves the id) and hang the summary card as the first reply.
-    ts = None
-    if channel and channel[0] in "CGDZ":
-        resp = client.files_upload_v2(
-            channel=channel, file=summary_png, filename=f"{d.isoformat()}-summary.png",
-            title=f"Cloud costs {d.isoformat()}", initial_comment=headline)
-        ts = _first_share_ts(resp)
-    if ts is None:
-        parent = client.chat_postMessage(channel=channel, text=headline,
-                                         unfurl_links=False, unfurl_media=False)
-        channel, ts = parent["channel"], parent["ts"]
-        client.files_upload_v2(channel=channel, thread_ts=ts, file=summary_png,
-                               filename=f"{d.isoformat()}-summary.png",
-                               title=f"Cloud costs {d.isoformat()}")
+    # Upload every image up front to get file ids. Doing them all first lets the
+    # files settle before they're referenced in a block (Slack rejects a just-
+    # uploaded file with `invalid_blocks`); _post_blocks retries for the rest.
+    uploaded = [(name, _upload_id(client, path, name, f"{name}.png"))
+                for name, path in images]
 
-    # Mentions sit just below the summary card — as the first reply, not on the card
-    # itself. An @id notifies from a thread reply just the same.
-    if mention:
-        client.chat_postMessage(channel=channel, thread_ts=ts, text=mention,
-                                unfurl_links=False, unfurl_media=False)
+    # Root: headline + mentions, then the summary card as an inline image block.
+    head = f"*Cloud costs — {d.isoformat()}*" + (f"\n{mention}" if mention else "")
+    _, summary_id = uploaded[0]
+    root = _post_blocks(
+        client, channel=channel, text=f"Cloud cost report — {d.isoformat()}",
+        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": head}},
+                _image_block(summary_id, "cost summary")],
+        unfurl_links=False, unfurl_media=False)
+    channel, ts = root["channel"], root["ts"]
 
-    for name, path in images[1:]:
-        client.files_upload_v2(channel=channel, thread_ts=ts, file=path,
-                               filename=f"{name}.png", title=name)
+    # Breakdowns thread under the summary, each as its own image block.
+    for name, fid in uploaded[1:]:
+        _post_blocks(client, channel=channel, thread_ts=ts, text=name,
+                     blocks=[_image_block(fid, name)],
+                     unfurl_links=False, unfurl_media=False)
 
-    # The workbook is the deliverable — if the upload fails the run has not really
-    # succeeded, so this is allowed to raise rather than being swallowed.
+    # The workbook is the deliverable — allowed to raise rather than be swallowed.
     client.files_upload_v2(
         channel=channel, thread_ts=ts, file=xlsx_path,
         filename=f"{d.isoformat()}-cloud-costs.xlsx",
         title=f"Cloud costs {d.isoformat()}",
-        initial_comment="Full per-service breakdown, 7 days per account.",
-    )
+        initial_comment="Full per-service breakdown, 7 days per account.")
     log.info("Posted report and workbook to %s", cfg["slack_channel_id"])

@@ -140,8 +140,10 @@ def _upload(cfg: dict, path: str, thread_ts: str | None = None,
 
 
 def _upload_ts(resp: dict | None) -> str | None:
-    """Best-effort message ts from a files.upload response, so replies can thread
-    under a root image. Xyne echoes a few shapes; check the common ones."""
+    """Message ts from a files.upload response, so breakdowns thread under the
+    summary card. Xyne returns it as file.shares.<vis>.<channel>[0].ts (not at the
+    top level or file.ts). Missing it makes post() fall back to a text root and
+    duplicate the summary, so all three spots are checked."""
     if not resp:
         return None
     if resp.get("ts"):
@@ -158,8 +160,9 @@ def _upload_ts(resp: dict | None) -> str | None:
 
 
 def post(cfg: dict, report: dict, xlsx_path: str) -> None:
-    """Same images as the Slack report — the summary card as the root, every
-    breakdown threaded, then the workbook. Xyne renders images, not text tables."""
+    """Same images as the Slack report — the summary card IS the root (image with
+    the headline + mentions as its comment), every breakdown threaded under it, then
+    the workbook. Xyne renders images, not text tables."""
     if not configured(cfg):
         log.info("Xyne not configured — skipping")
         return
@@ -173,30 +176,26 @@ def post(cfg: dict, report: dict, xlsx_path: str) -> None:
     d = report["date"]
 
     # Xyne has its own directory and ID scheme (cuid2, not Slack's U…), so its
-    # mention is a separate literal string, posted just below the summary card.
+    # mention is a separate literal string, carried on the summary card's comment.
     xm = (cfg.get("xyne_mention") or "").strip()
-    headline = f"*Cloud costs — {d.isoformat()}*"
+    comment = f"*Cloud costs — {d.isoformat()}*" + (f"\n{xm}" if xm else "")
     _, summary_png = images[0]
 
-    # Try the summary card AS the root (image + headline comment); fall back to a
-    # text root if the upload response doesn't give a ts to thread under.
-    root = _upload(cfg, summary_png, comment=headline,
-                   filename=f"{d.isoformat()}-summary.png")
+    # Root = the summary card itself (image + headline comment). Xyne returns the
+    # message ts on upload, so the breakdowns thread under it. Fall back to a text
+    # root only if that ts is missing, so the report still hangs together.
+    root = _upload(cfg, summary_png, comment=comment, filename=f"{d.isoformat()}-summary.png")
     ts = _upload_ts(root)
     if ts is None:
-        text_root = _post(cfg, headline)
+        text_root = _post(cfg, comment)
         if text_root is None:
             log.error("Xyne root failed — skipping the rest of the report")
             return
         ts = text_root.get("ts")
-        if root is None:                                   # image didn't post above
+        if root is None:                                    # image didn't post above
             _upload(cfg, summary_png, thread_ts=ts, filename=f"{d.isoformat()}-summary.png")
 
-    # Mentions just below the summary card, matching Slack.
-    if xm:
-        _post(cfg, xm, thread_ts=ts)
-
-    for name, path in images[1:]:
+    for name, path in images[1:]:                           # breakdowns threaded
         _upload(cfg, path, thread_ts=ts, filename=f"{name}.png")
 
     if _upload(cfg, xlsx_path, thread_ts=ts,
