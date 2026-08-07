@@ -98,8 +98,10 @@ def _post(cfg: dict, text: str, thread_ts: str | None = None) -> dict | None:
     return resp
 
 
-def _upload(cfg: dict, path: str, thread_ts: str | None = None) -> bool:
-    """Attach the workbook via files.upload (multipart)."""
+def _upload(cfg: dict, path: str, thread_ts: str | None = None,
+            comment: str | None = None, filename: str | None = None) -> dict | None:
+    """Upload a file via files.upload (multipart). Returns the parsed response so
+    the caller can thread under it, or None on failure."""
     p = Path(path)
     boundary = "----costreport" + uuid.uuid4().hex
     ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
@@ -110,11 +112,12 @@ def _upload(cfg: dict, path: str, thread_ts: str | None = None) -> bool:
 
     body = bytearray()
     body += part("channels", cfg["xyne_channel"])
-    body += part("initial_comment", "Full per-service breakdown, 7 days per account.")
+    if comment:
+        body += part("initial_comment", comment)
     if thread_ts:
         body += part("thread_ts", thread_ts)
     body += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
-             f'filename="{p.name}"\r\nContent-Type: {ctype}\r\n\r\n').encode()
+             f'filename="{filename or p.name}"\r\nContent-Type: {ctype}\r\n\r\n').encode()
     body += p.read_bytes()
     body += f"\r\n--{boundary}--\r\n".encode()
 
@@ -129,61 +132,75 @@ def _upload(cfg: dict, path: str, thread_ts: str | None = None) -> bool:
             resp = json.loads(r.read().decode("utf-8", "replace"), strict=False)
     except Exception as e:
         log.error("Xyne file upload failed: %s", e)
-        return False
+        return None
     if not resp.get("ok"):
         log.error("Xyne rejected the upload: %s", resp.get("error"))
-        return False
-    return True
+        return None
+    return resp
+
+
+def _upload_ts(resp: dict | None) -> str | None:
+    """Best-effort message ts from a files.upload response, so replies can thread
+    under a root image. Xyne echoes a few shapes; check the common ones."""
+    if not resp:
+        return None
+    if resp.get("ts"):
+        return resp["ts"]
+    files = resp.get("files") or ([resp["file"]] if resp.get("file") else [])
+    for f in files:
+        if (f or {}).get("ts"):
+            return f["ts"]
+        for vis in ((f or {}).get("shares") or {}).values():
+            for arr in vis.values():
+                if arr and arr[0].get("ts"):
+                    return arr[0]["ts"]
+    return None
 
 
 def post(cfg: dict, report: dict, xlsx_path: str) -> None:
-    """Same content as the Slack report, flattened for Xyne's text-only messages."""
+    """Same images as the Slack report — the summary card as the root, every
+    breakdown threaded, then the workbook. Xyne renders images, not text tables."""
     if not configured(cfg):
         log.info("Xyne not configured — skipping")
         return
 
-    top, attachments = slack.build_root_blocks(cfg, report)
-
-    # Strip Slack's own mention block wherever it sits — it lives at the end of the
-    # body, and its <@U…> tokens are Slack-workspace IDs that resolve to nothing in
-    # Xyne. Scanning both lists keeps this correct if the block ever moves again.
-    slack_mention = slack._mention_text(cfg.get("mention", ""))
-    blocks = [b for b in (top + attachments[0]["blocks"])
-              if b.get("text", {}).get("text") != slack_mention]
-    root_text = _blocks_to_text(blocks)
-
-    # Xyne has its own directory and its own ID scheme (cuid2, not Slack's U…), so
-    # `xyne_mention` is a separate literal string. Appended, matching Slack.
-    xm = (cfg.get("xyne_mention") or "").strip()
-    if xm:
-        root_text = f"{root_text}\n{xm}"
-
-    root = _post(cfg, root_text)
-    if root is None:
-        log.error("Xyne root message failed — skipping the rest of the report")
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="cost-xyne-")
+    images = slack.render_images(cfg, report, tmp)          # summary first
+    if not images:
+        log.warning("Xyne: no images rendered — skipping")
         return
-    ts = root.get("ts")
+    d = report["date"]
 
-    infra = {s["cloud"] for s in report["sections"] if s["cloud"] not in ("GMP", "VENDOR")}
-    vend = next((s for s in report["sections"] if s["cloud"] == "VENDOR"), None)
-    replies = [
-        slack._account_split_blocks(cfg, report, infra, "*Cloud — account split*"),
-        slack._section_table_blocks(cfg, report, vend) if vend else [],
-        slack._account_split_blocks(cfg, report, {"GMP"}, "*Maps — account split*")
-        + slack._gmp_table_blocks(cfg, report),
-        slack._runrate_blocks(cfg, report),
-        slack._per_ride_blocks(cfg, report),
-    ]
-    for section in sorted(report["sections"], key=lambda x: x["total_report"], reverse=True):
-        if section["cloud"] in ("GMP", "VENDOR"):
-            continue
-        replies.append(slack._section_table_blocks(cfg, report, section))
-    replies.append(slack._movers_blocks(cfg, report))
+    # Xyne has its own directory and ID scheme (cuid2, not Slack's U…), so its
+    # mention is a separate literal string, posted just below the summary card.
+    xm = (cfg.get("xyne_mention") or "").strip()
+    headline = f"*Cloud costs — {d.isoformat()}*"
+    _, summary_png = images[0]
 
-    for blocks in replies:
-        _post(cfg, _blocks_to_text(blocks), thread_ts=ts)
+    # Try the summary card AS the root (image + headline comment); fall back to a
+    # text root if the upload response doesn't give a ts to thread under.
+    root = _upload(cfg, summary_png, comment=headline,
+                   filename=f"{d.isoformat()}-summary.png")
+    ts = _upload_ts(root)
+    if ts is None:
+        text_root = _post(cfg, headline)
+        if text_root is None:
+            log.error("Xyne root failed — skipping the rest of the report")
+            return
+        ts = text_root.get("ts")
+        if root is None:                                   # image didn't post above
+            _upload(cfg, summary_png, thread_ts=ts, filename=f"{d.isoformat()}-summary.png")
 
-    if _upload(cfg, xlsx_path, thread_ts=ts):
+    # Mentions just below the summary card, matching Slack.
+    if xm:
+        _post(cfg, xm, thread_ts=ts)
+
+    for name, path in images[1:]:
+        _upload(cfg, path, thread_ts=ts, filename=f"{name}.png")
+
+    if _upload(cfg, xlsx_path, thread_ts=ts,
+               comment="Full per-service breakdown, 7 days per account."):
         log.info("Posted report and workbook to Xyne channel %s", cfg["xyne_channel"])
     else:
         log.warning("Xyne report posted but the workbook upload failed")

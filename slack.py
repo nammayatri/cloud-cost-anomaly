@@ -10,10 +10,14 @@ the digits line up — proportional text turns a cost column into noise.
 """
 
 import logging
+import re
+import tempfile
+from pathlib import Path
 
 from slack_sdk import WebClient
 
 import collect
+import image_render
 import money
 
 log = logging.getLogger("cost-anomaly.slack")
@@ -406,62 +410,232 @@ def _movers_blocks(cfg: dict, report: dict, limit: int = 10) -> list[dict]:
                     rows, left_cols=(0, 1)))
 
 
-def post(cfg: dict, report: dict, xlsx_path: str) -> None:
-    """Root message, then the breakdown as threaded replies, then the workbook."""
-    client = WebClient(token=cfg["slack_bot_token"])
-    d = report["date"]
+# --- Image rendering ----------------------------------------------------------
+#
+# The same tables the text path builds are rendered to PNGs and posted as images,
+# so the morning report reads cleanly on a phone (a Slack code block wraps and
+# shrinks on a small screen). The block-builders above stay the single source of
+# the numbers — Xyne still renders them as text — and this layer only re-styles
+# their output, so the two channels cannot drift.
 
+# Verdict dot colours, matched to the run-rate status (over / slightly over / under).
+_VERDICT_COLORS = {
+    ":red_circle:": "#d62728",
+    ":rotating_light:": "#d62728",
+    ":large_yellow_circle:": "#d9a400",
+    ":warning:": "#d9a400",
+    ":large_green_circle:": "#2ca02c",
+}
+_INK = "#1d1d21"
+_TITLE = "#111318"
+_MUTED = "#6b6f76"
+_GREEN = "#1a9850"     # cost down — good
+_RED = "#d62728"       # cost up — bad
+
+# A signed percentage token, e.g. +90%, -57%, +7% — always signed in these tables.
+_PCT_RE = re.compile(r"[+-]\d[\d,]*%")
+
+
+def _pct_segments(text: str) -> list[tuple[str, str | None]] | None:
+    """Split a table row so each signed percentage is its own coloured segment.
+    These are cost changes, so the sign reads by impact: a rise (+) is red, a fall
+    (-) is green. Everything else keeps the base colour. Returns None when the row
+    has no percentage, so it renders as a plain line."""
+    segs: list[tuple[str, str | None]] = []
+    last = 0
+    for m in _PCT_RE.finditer(text):
+        if m.start() > last:
+            segs.append((text[last:m.start()], None))
+        tok = m.group()
+        segs.append((tok, _RED if tok[0] == "+" else _GREEN))
+        last = m.end()
+    if not segs:
+        return None
+    if last < len(text):
+        segs.append((text[last:], None))
+    return segs
+
+
+def _process_text(raw: str) -> tuple[str, str | None, bool]:
+    """A markdown/emoji title or verdict line -> (clean text, colour, bold)."""
+    color = None
+    bold = raw.lstrip().startswith("*")
+    for code, c in _VERDICT_COLORS.items():
+        if code in raw:
+            color = c
+            raw = raw.replace(code, "●")      # ● in place of the :emoji:
+    raw = raw.replace("*", "").replace("_", "").strip()
+    return raw, (color or (_TITLE if bold else _INK)), bold
+
+
+def _blocks_to_lines(blocks: list[dict]) -> list[dict]:
+    """Flatten Block Kit into styled monospace lines for image_render.
+
+    Code-fenced tables render in a regular weight with the header row bolded;
+    titles/verdicts render bold/coloured; context blocks render small and muted.
+    A header repeated across chunked blocks (the text path splits long tables) is
+    emitted once.
+    """
+    lines: list[dict] = []
+    run_header: str | None = None      # header of the current fenced run, to de-dupe
+    for b in blocks or []:
+        typ = b.get("type")
+        if typ == "divider":
+            continue
+        if typ == "header":
+            lines.append({"text": b.get("text", {}).get("text", ""), "size": 17,
+                          "bold": True, "color": _TITLE})
+            run_header = None
+            continue
+        if typ == "context":
+            txt = " ".join(e.get("text", "") for e in b.get("elements", []))
+            txt = txt.replace("*", "").replace("_", "").strip()
+            if txt:
+                lines.append({"text": txt, "size": 11, "bold": False, "color": _MUTED})
+            run_header = None
+            continue
+        if typ != "section":
+            continue
+        text = b.get("text", {}).get("text", "")
+        for i, part in enumerate(text.split("```")):
+            if i % 2 == 1:                          # inside a fence => table rows
+                rows = [r for r in part.split("\n") if r.strip()]
+                if rows and run_header is not None and rows[0] == run_header:
+                    rows = rows[1:]                 # drop a repeated header
+                elif rows:
+                    run_header = rows[0]
+                for r in rows:
+                    r = r.rstrip()
+                    line = {"text": r, "size": 13, "bold": r == run_header, "color": _INK}
+                    if r != run_header:
+                        segs = _pct_segments(r)
+                        if segs:
+                            line["segments"] = segs
+                    lines.append(line)
+            else:                                   # surrounding title/verdict text
+                for ln in part.split("\n"):
+                    if not ln.strip():
+                        continue
+                    t, color, bold = _process_text(ln)
+                    lines.append({"text": t, "size": 14, "bold": bold, "color": color})
+                    run_header = None
+    return lines
+
+
+def _account(label: str) -> str:
+    """Filesystem-safe short name for an image filename."""
+    keep = "".join(c if c.isalnum() else "-" for c in label).strip("-").lower()
+    return keep or "table"
+
+
+def _image_specs(cfg: dict, report: dict) -> list[tuple[str, list[dict]]]:
+    """Ordered (name, blocks) for every report table, the summary card first.
+
+    Single source of the report's shape, shared by both the Slack and Xyne image
+    paths so the two channels render exactly the same set in the same order.
+    """
     top_blocks, attachments = build_root_blocks(cfg, report)
-    main = client.chat_postMessage(
-        channel=cfg["slack_channel_id"],
-        blocks=top_blocks,
-        attachments=attachments,
-        text=f"Cloud cost report — {d.isoformat()}",
-        unfurl_links=False,
-        unfurl_media=False,
-    )
-    channel, ts = main["channel"], main["ts"]
+    mention = _mention_text(cfg.get("mention", ""))
+    # Summary card = header + verdict + totals table, minus the mention row — an
+    # image can't ping anyone, so the mentions ride the message text instead.
+    summary = top_blocks + [b for b in attachments[0]["blocks"]
+                            if b.get("text", {}).get("text") != mention]
 
-    def reply(blocks, fallback):
-        if blocks:
-            client.chat_postMessage(channel=channel, thread_ts=ts, text=fallback,
-                                    blocks=blocks, unfurl_links=False, unfurl_media=False)
-
-    infra = {s["cloud"] for s in report["sections"] if s["cloud"] not in ("GMP", "HV")}
-
-    # 1 — account split of the infrastructure clouds
-    reply(_account_split_blocks(cfg, report, infra, "*Cloud — account split*"),
-          "Cloud account split")
-
-    # 1b — third-party vendor: one line item, split by module (per-service table)
+    infra = {s["cloud"] for s in report["sections"] if s["cloud"] not in ("GMP", "VENDOR")}
+    specs: list[tuple[str, list[dict]]] = [
+        ("summary", summary),
+        ("cloud-account-split",
+         _account_split_blocks(cfg, report, infra, "*Cloud — account split*")),
+    ]
     vend = next((sec for sec in report["sections"] if sec["cloud"] == "VENDOR"), None)
     if vend:
-        reply(_section_table_blocks(cfg, report, vend), "Vendor by module")
-
-    # 2 — Maps: project split plus the per-API request volumes
-    maps_blocks = _account_split_blocks(cfg, report, {"GMP"}, "*Maps — account split*")
-    maps_blocks += _gmp_table_blocks(cfg, report)
-    reply(maps_blocks, "Maps breakdown")
-
-    # 3 — monthly run-rate against budget
-    reply(_runrate_blocks(cfg, report), "Monthly run-rate")
-
-    # 4 — unit economics
-    reply(_per_ride_blocks(cfg, report), "Cost per ride")
-
-    # Detail: per-service tables, then the biggest movers.
+        specs.append(("vendor-by-module", _section_table_blocks(cfg, report, vend)))
+    specs.append(("maps",
+                  _account_split_blocks(cfg, report, {"GMP"}, "*Maps — account split*")
+                  + _gmp_table_blocks(cfg, report)))
+    specs.append(("monthly-run-rate", _runrate_blocks(cfg, report)))
+    specs.append(("cost-per-ride", _per_ride_blocks(cfg, report)))
     for section in sorted(report["sections"], key=lambda x: x["total_report"], reverse=True):
         if section["cloud"] in ("GMP", "VENDOR"):
             continue          # GMP via the per-API table, vendor via the by-module reply
-        reply(_section_table_blocks(cfg, report, section), f"{section['label']} breakdown")
-    reply(_movers_blocks(cfg, report), "Biggest increases")
+        specs.append((_account(section["label"]),
+                      _section_table_blocks(cfg, report, section)))
+    specs.append(("biggest-increases", _movers_blocks(cfg, report)))
+    return [(name, blocks) for name, blocks in specs if blocks]
+
+
+def render_images(cfg: dict, report: dict, tmpdir: str) -> list[tuple[str, str]]:
+    """Render every report table to a PNG. Returns [(name, path)], summary first."""
+    out: list[tuple[str, str]] = []
+    for i, (name, blocks) in enumerate(_image_specs(cfg, report)):
+        lines = _blocks_to_lines(blocks)
+        if not lines:
+            continue
+        path = image_render.render(lines, str(Path(tmpdir) / f"{i:02d}-{name}.png"))
+        out.append((name, path))
+    return out
+
+
+def _first_share_ts(resp) -> str | None:
+    """Pull the posted message ts out of a files_upload_v2 response, so the rest of
+    the report threads under the summary image. The shares map is keyed by channel
+    id (not the '#name' we may have sent), so take the first ts found."""
+    try:
+        files = resp.get("files") or ([resp["file"]] if resp.get("file") else [])
+        for f in files:
+            for vis in ((f or {}).get("shares") or {}).values():
+                for arr in vis.values():
+                    if arr and arr[0].get("ts"):
+                        return arr[0]["ts"]
+    except Exception:
+        pass
+    return None
+
+
+def post(cfg: dict, report: dict, xlsx_path: str) -> None:
+    """The summary card as the root image, every breakdown as a threaded image,
+    then the workbook. Same tables as the text report — rendered for a phone."""
+    client = WebClient(token=cfg["slack_bot_token"])
+    d = report["date"]
+    channel = cfg["slack_channel_id"]
+    tmp = tempfile.mkdtemp(prefix="cost-img-")
+    images = render_images(cfg, report, tmp)          # summary first
+    mention = _mention_text(cfg.get("mention", ""))
+    headline = f"*Cloud costs — {d.isoformat()}*"
+    _, summary_png = images[0]
+
+    # The summary card IS the root message. files_upload_v2 needs a channel id
+    # (^[CGDZ]…); prod stores one, so the image posts straight into the channel. If
+    # only a #name is available we can't upload to it directly, so we open a text
+    # root (which also resolves the id) and hang the summary card as the first reply.
+    ts = None
+    if channel and channel[0] in "CGDZ":
+        resp = client.files_upload_v2(
+            channel=channel, file=summary_png, filename=f"{d.isoformat()}-summary.png",
+            title=f"Cloud costs {d.isoformat()}", initial_comment=headline)
+        ts = _first_share_ts(resp)
+    if ts is None:
+        parent = client.chat_postMessage(channel=channel, text=headline,
+                                         unfurl_links=False, unfurl_media=False)
+        channel, ts = parent["channel"], parent["ts"]
+        client.files_upload_v2(channel=channel, thread_ts=ts, file=summary_png,
+                               filename=f"{d.isoformat()}-summary.png",
+                               title=f"Cloud costs {d.isoformat()}")
+
+    # Mentions sit just below the summary card — as the first reply, not on the card
+    # itself. An @id notifies from a thread reply just the same.
+    if mention:
+        client.chat_postMessage(channel=channel, thread_ts=ts, text=mention,
+                                unfurl_links=False, unfurl_media=False)
+
+    for name, path in images[1:]:
+        client.files_upload_v2(channel=channel, thread_ts=ts, file=path,
+                               filename=f"{name}.png", title=name)
 
     # The workbook is the deliverable — if the upload fails the run has not really
     # succeeded, so this is allowed to raise rather than being swallowed.
     client.files_upload_v2(
-        channel=channel,
-        thread_ts=ts,
-        file=xlsx_path,
+        channel=channel, thread_ts=ts, file=xlsx_path,
         filename=f"{d.isoformat()}-cloud-costs.xlsx",
         title=f"Cloud costs {d.isoformat()}",
         initial_comment="Full per-service breakdown, 7 days per account.",
