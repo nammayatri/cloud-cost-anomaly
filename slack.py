@@ -376,17 +376,18 @@ def _gmp_table_blocks(cfg: dict, report: dict, limit: int = 20) -> list[dict]:
     return _chunk_code_blocks(title, _mono_table(["service", "requests", f"current{rc}"], rows))
 
 
-def _movers_blocks(cfg: dict, report: dict, limit: int = 10) -> list[dict]:
-    """Biggest day-over-day increases across every account.
+def _movers_blocks(cfg: dict, report: dict, limit: int = 10, rising: bool = True) -> list[dict]:
+    """Biggest day-over-day movers across every account, in one direction.
 
     Ranked by absolute money moved, not percent: a 400% jump on a ₹20 service is
     trivia, while a 12% rise on the biggest line item is what's worth chasing.
+    `rising` picks increases (default) or decreases — the same table, mirrored.
     """
     movers = []
     for s in report["sections"]:
         for row in s["rows"]:
             delta = row["today_report"] - row["yesterday_report"]
-            if delta > 0:
+            if (delta > 0) if rising else (delta < 0):
                 movers.append({
                     "delta": delta,
                     "account": _display(s, report),
@@ -397,18 +398,22 @@ def _movers_blocks(cfg: dict, report: dict, limit: int = 10) -> list[dict]:
                 })
     if not movers:
         return []
-    movers.sort(reverse=True, key=lambda m: m["delta"])
+    # Increases: largest positive first. Decreases: largest drop (most negative) first.
+    movers.sort(key=lambda m: m["delta"], reverse=rising)
     rc = cfg["report_currency"]
     dec = 0 if rc == "INR" else 2
+    verb = "increase" if rising else "decrease"
     # Both absolute levels are shown, not just the delta: "+6,537" means something
     # different on a ₹33k line than on a ₹300 one, and the rank order alone does
-    # not convey that.
+    # not convey that. The delta keeps its sign so the direction is unambiguous.
     rows = [[m["service"][:30], m["account"][:16], _num(m["today"], dec),
-             _num(m["prev"], dec), "+" + _num(m["delta"], dec), _pct_cell(m["pct"])]
+             _num(m["prev"], dec), ("+" if m["delta"] > 0 else "") + _num(m["delta"], dec),
+             _pct_cell(m["pct"])]
             for m in movers[:limit]]
+    title = f"*Biggest {verb}s vs the previous day*"
     return _chunk_code_blocks(
-        "*Biggest increases vs the previous day*",
-        _mono_table(["Service", "Account", f"cost{rc}", "prev day", "increase", "vs prev"],
+        title,
+        _mono_table(["Service", "Account", f"cost{rc}", "prev day", verb, "vs prev"],
                     rows, left_cols=(0, 1)))
 
 
@@ -562,7 +567,8 @@ def _image_specs(cfg: dict, report: dict) -> list[tuple[str, list[dict]]]:
             continue          # GMP via the per-API table, vendor via the by-module reply
         specs.append((_account(section["label"]),
                       _section_table_blocks(cfg, report, section)))
-    specs.append(("biggest-increases", _movers_blocks(cfg, report)))
+    specs.append(("biggest-increases", _movers_blocks(cfg, report, rising=True)))
+    specs.append(("biggest-decreases", _movers_blocks(cfg, report, rising=False)))
     return [(name, blocks) for name, blocks in specs if blocks]
 
 
