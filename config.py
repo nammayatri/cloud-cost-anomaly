@@ -104,14 +104,17 @@ _DEFAULTS = {
     "cost_ch_secure": False,
 
     # --- Third-party vendor daily cost (optional) ---
-    # A billing source with no machine credential: authenticated by a session
-    # token pasted into the secret and refreshed periodically. Everything vendor-
-    # specific (endpoint, token, labels) is supplied here, never hardcoded.
-    "vendor_api_url": None,
-    "vendor_origin": None,               # request Origin header, if the API needs it
-    "vendor_client_id": None,
-    "vendor_refresh_token": None,        # session token; refresh in the secret as needed
-    "vendor_current_credentials": None,
+    # Cost is computed here, not fetched pre-computed: a machine-credentialed logs
+    # API returns one row per request made that day (endpoint + status), and each
+    # is priced by `vendor_pricing`. Everything vendor-specific (endpoint,
+    # credentials, prices) is supplied here, never hardcoded.
+    "vendor_logs_api_url": None,         # POST {"date": "YYYY-MM-DD"} -> presigned CSV url
+    "vendor_app_id": None,               # "appid" request header
+    "vendor_app_key": None,              # "appKey" request header — secret
+    # Price per request, keyed by endpoint path exactly as logged minus any query
+    # string (e.g. "/v1/readId"), in report_currency. An endpoint with no entry
+    # here still shows up in the report at zero cost — see vendor_billing.py.
+    "vendor_pricing": {},
     "vendor_account_label": "Vendor",    # account-column label
     "vendor_type": "Data and Tools",     # `type` grouping for these rows
     "vendor_cost_head": "Vendor",
@@ -132,7 +135,7 @@ _CAST = {
 _LIST_KEYS = ("gcp_projects", "gmp_projects")
 
 # Env vars that carry structured data, as a JSON string.
-_JSON_KEYS = ("aws_accounts", "monthly_budgets")
+_JSON_KEYS = ("aws_accounts", "monthly_budgets", "vendor_pricing")
 
 _BOOL_KEYS = ("clickhouse_secure", "fx_fetch", "cost_ch_secure")
 

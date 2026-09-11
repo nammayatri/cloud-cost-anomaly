@@ -50,11 +50,18 @@
   "cost_ch_database": "cost_analytics",
   "cost_ch_table": "cost_daily",
   "fx_currencyapi_key": "<currencyapi-net-key-optional>",
-  "vendor_api_url": "<vendor-billing-endpoint>",
-  "vendor_origin": "<vendor-dashboard-origin>",
-  "vendor_client_id": "<vendor-client-id>",
-  "vendor_refresh_token": "<48h-session-token-refresh-every-48h>",
-  "vendor_current_credentials": "<vendor-session-context-optional>",
+  "vendor_logs_api_url": "<vendor-daily-logs-endpoint>",
+  "vendor_app_id": "<vendor-app-id>",
+  "vendor_app_key": "<vendor-app-key>",
+  "vendor_pricing": {
+    "/v1/readId": 0,
+    "/v1/matchFace": 0,
+    "/v1/checkLiveness": 0,
+    "/v1/async/RCVerification": 0,
+    "/v1/async/checkDL": 0,
+    "/api/matchFields": 0,
+    "/api/centralDBCheck": 0
+  },
   "vendor_account_label": "Vendor",
   "vendor_type": "Data and Tools",
   "vendor_cost_head": "Vendor"
