@@ -133,6 +133,21 @@ spec:
                   value: "<XYNE_HOST>"
                 - name: XYNE_CHANNEL
                   value: "<XYNE_CHANNEL>"
+                - name: VENDOR_LOGS_API_URL
+                  value: "https://billing-dashboard.hyperverge.co/v1/logs/module/daily"
+                - name: VENDOR_APP_ID
+                  value: "<VENDOR_APP_ID>"
+                - name: VENDOR_PRICING
+                  value: |
+                    {
+                      "/v1/readId": 0,
+                      "/v1/matchFace": 0,
+                      "/v1/checkLiveness": 0,
+                      "/v1/async/RCVerification": 0,
+                      "/v1/async/checkDL": 0,
+                      "/api/matchFields": 0,
+                      "/api/centralDBCheck": 0
+                    }
               envFrom:
                 - secretRef:
                     name: cost-report-secret

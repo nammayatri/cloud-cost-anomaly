@@ -91,6 +91,9 @@ All settings come from **either** environment variables **or** `config.json`. En
 | `xyne_jwt` | `XYNE_JWT` | — | App JWT. Needs `chat:write` and `files:write` |
 | `xyne_channel` | `XYNE_CHANNEL` | — | Channel **name without** a leading `#` |
 | `lookback_days` | `LOOKBACK_DAYS` | `21` | History pulled (must be ≥ 8 for the WoW column) |
+| `vendor_logs_api_url` | `VENDOR_LOGS_API_URL` | — | Third-party verification vendor's daily request-logs endpoint. Omit to skip the vendor entirely |
+| `vendor_app_id` / `vendor_app_key` | `VENDOR_APP_ID` / `VENDOR_APP_KEY` | — | Vendor API credentials (`appid` / `appKey` headers). Key is a secret |
+| `vendor_pricing` | `VENDOR_PRICING` | `{}` | JSON, price per request keyed by endpoint path (no query string), in `report_currency` |
 
 ## 🔐 IAM
 
