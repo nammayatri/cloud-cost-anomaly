@@ -245,12 +245,14 @@ def monthly_projection(cfg: dict, report: dict) -> list[dict]:
     days = int(cfg.get("projection_days") or 30)
     t = report["totals"]
 
+    vendor_label = cfg.get("vendor_cost_head") or "Vendor"
+
     rows = []
     for cloud, daily in sorted(t["by_cloud"].items(), key=lambda kv: kv[1], reverse=True):
         projected = daily * days
         budget = budgets.get(cloud)
         rows.append({
-            "label": cloud_name(cloud),
+            "label": vendor_label if cloud == "VENDOR" else cloud_name(cloud),
             "daily": daily,
             "projected": projected,
             "budget": budget,
