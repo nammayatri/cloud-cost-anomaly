@@ -93,7 +93,7 @@ All settings come from **either** environment variables **or** `config.json`. En
 | `lookback_days` | `LOOKBACK_DAYS` | `21` | History pulled (must be ≥ 8 for the WoW column) |
 | `vendor_logs_api_url` | `VENDOR_LOGS_API_URL` | — | Third-party verification vendor's daily request-logs endpoint. Omit to skip the vendor entirely |
 | `vendor_app_id` / `vendor_app_key` | `VENDOR_APP_ID` / `VENDOR_APP_KEY` | — | Vendor API credentials (`appid` / `appKey` headers). Key is a secret |
-| `vendor_pricing` | `VENDOR_PRICING` | `{}` | JSON, price per request keyed by endpoint path (no query string), in `report_currency` |
+| `vendor_pricing` | `VENDOR_PRICING` | `{}` | JSON, keyed by billing UNIT (not endpoint — see `vendor_billing._ENDPOINT_UNITS`); each value a list of `[lo, hi_or_null, price]` monthly-cumulative slab tiers, in `report_currency` |
 
 ## 🔐 IAM
 

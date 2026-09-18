@@ -77,15 +77,84 @@ def _row(day: date, cloud: str, account: str, service: str,
     }
 
 
-def _vendor_rows(cfg: dict, day) -> list[dict]:
-    """Vendor per-module rows for one day, if configured. Reporting currency, fx
-    1.0. Never raises — a session-token expiry must not fail the whole write."""
+def _vendor_month_to_date(cfg: dict, day: date) -> dict[str, int]:
+    """Sum of `units` already recorded this month, per billing unit, for every
+    day strictly before `day`. This is the baseline a tiered price needs to
+    know which slab today's requests fall into.
+
+    Reads FINAL (see module docstring) so an unmerged duplicate row from a
+    same-day re-run never double-counts the baseline. Returns {} — never
+    raises — if the store isn't configured or the query fails; the caller
+    then prices today's count entirely in the lowest tier, which undercounts
+    rather than blocking the run on a ClickHouse hiccup.
+    """
+    if not configured(cfg):
+        return {}
+    month_start = day.replace(day=1)
+    db = cfg.get("cost_ch_database", "cost_analytics")
+    tbl = cfg.get("cost_ch_table", "cost_daily")
+    query = (
+        f"SELECT service, sum(units) AS mtd FROM {db}.{tbl} FINAL "
+        f"WHERE cost_head = {{cost_head:String}} AND type = {{vtype:String}} "
+        f"AND date >= {{start:Date}} AND date < {{day:Date}} "
+        f"GROUP BY service FORMAT JSONEachRow"
+    )
+    qs = urllib.parse.urlencode({
+        "query": query,
+        "param_cost_head": cfg.get("vendor_cost_head", "Vendor"),
+        "param_vtype": cfg.get("vendor_type", "Data and Tools"),
+        "param_start": month_start.isoformat(),
+        "param_day": day.isoformat(),
+    })
+    scheme = "https" if cfg.get("cost_ch_secure") else "http"
+    url = f"{scheme}://{cfg['cost_ch_host']}:{cfg.get('cost_ch_port', 8123)}/?{qs}"
+    req = urllib.request.Request(url, headers={
+        "X-ClickHouse-User": cfg["cost_ch_user"],
+        "X-ClickHouse-Key": cfg["cost_ch_password"],
+    })
+    try:
+        resp = urllib.request.urlopen(req, timeout=_TIMEOUT)
+        out = {}
+        for line in resp.read().decode().splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            out[row["service"]] = int(float(row["mtd"]))
+        return out
+    except Exception as e:
+        log.warning("Vendor month-to-date query for %s failed (%s) — pricing today's "
+                    "volume entirely in the lowest tier", day, e)
+        return {}
+
+
+def vendor_priced_day(cfg: dict, day: date) -> list[dict] | None:
+    """Priced vendor rows for one day: [{"account","service","cost","units"}].
+
+    Returns None — distinct from a real [] — when the day's log is
+    unavailable (vendor fetch failure; the vendor's export has real gaps, see
+    vendor_billing's module docstring). A day with a valid, empty log
+    (genuinely zero traffic) returns [] instead. Callers must not conflate the
+    two: treating "we don't know" as "zero" would understate every later day's
+    tier once volume crosses a slab boundary.
+    """
     if not vendor_billing.configured(cfg):
         return []
     try:
-        hits = vendor_billing.fetch_day(cfg, day)
+        counts = vendor_billing.fetch_day_counts(cfg, day)
     except Exception as e:
-        log.error("Vendor billing fetch for %s failed (token expired?): %s", day, e)
+        log.warning("Vendor request log for %s unavailable: %s", day, e)
+        return None
+    if not counts:
+        return []
+    mtd = _vendor_month_to_date(cfg, day)
+    return vendor_billing.price_units(cfg, counts, mtd)
+
+
+def _vendor_rows(cfg: dict, day) -> list[dict]:
+    """Vendor per-unit rows for one day, if configured. Reporting currency, fx
+    1.0. Never raises — an unavailable day must not fail the whole write."""
+    hits = vendor_priced_day(cfg, day)
+    if not hits:
         return []
     th = (cfg.get("vendor_type", "Data and Tools"), cfg.get("vendor_cost_head", "Vendor"))
     return [_row(day, "VENDOR", h["account"], h["service"], h["cost"],
@@ -166,6 +235,57 @@ def _fx_series(cfg: dict, start: date, end: date) -> dict:
     return out
 
 
+def _vendor_backfill_rows(cfg: dict, start: date, end: date) -> list[dict]:
+    """Vendor rows for [start, end), pricing each day against a running
+    month-to-date total tracked IN MEMORY as the loop advances.
+
+    This can't reuse _vendor_month_to_date per day the way the live daily path
+    does: backfill inserts everything in one bulk _insert at the very end (see
+    backfill()), so a same-run earlier day's units are not yet in ClickHouse
+    when a later day in the same backfill would need them as its baseline —
+    querying per day would silently price every day as if it were the 1st of
+    the month. The running total is seeded from ClickHouse once per month
+    boundary crossed (via _vendor_month_to_date), which correctly picks up
+    real prior history for a backfill that starts mid-month, then advances
+    in memory from there.
+
+    A day whose log is unavailable is skipped (not zero-priced) and does not
+    advance the running total, consistent with vendor_priced_day's contract.
+    """
+    th = (cfg.get("vendor_type", "Data and Tools"), cfg.get("vendor_cost_head", "Vendor"))
+    rows: list[dict] = []
+    running: dict[str, int] = {}
+    seeded_month: tuple[int, int] | None = None
+    unavailable: list[date] = []
+
+    d = start
+    while d < end:
+        month_key = (d.year, d.month)
+        if month_key != seeded_month:
+            running = _vendor_month_to_date(cfg, d)
+            seeded_month = month_key
+        try:
+            day_counts = vendor_billing.fetch_day_counts(cfg, d)
+        except Exception as e:
+            log.warning("Vendor request log for %s unavailable during backfill: %s", d, e)
+            unavailable.append(d)
+            d += timedelta(days=1)
+            continue
+        if day_counts:
+            priced = vendor_billing.price_units(cfg, day_counts, running)
+            rows += [_row(d, "VENDOR", h["account"], h["service"], h["cost"],
+                          cfg["report_currency"], 1.0, units=h.get("units"), type_head=th)
+                     for h in priced]
+            for unit, n in day_counts.items():
+                running[unit] = running.get(unit, 0) + n
+        d += timedelta(days=1)
+
+    if unavailable:
+        log.warning("Vendor log unavailable for %d day(s) during backfill: %s",
+                    len(unavailable), ", ".join(x.isoformat() for x in unavailable))
+    return rows
+
+
 def backfill(cfg: dict, start: date, end: date) -> dict:
     """Populate cost_daily for [start, end) from each provider's own history.
 
@@ -219,12 +339,7 @@ def backfill(cfg: dict, start: date, end: date) -> dict:
     want = cfg.get("provider", "all")
 
     if vendor_billing.configured(cfg):
-        vend = []
-        d = start
-        while d < end:
-            vend += _vendor_rows(cfg, d)
-            d += timedelta(days=1)
-        counts["vendor"] = _insert(cfg, vend)
+        counts["vendor"] = _insert(cfg, _vendor_backfill_rows(cfg, start, end))
 
     if want in ("aws", "all") and cfg.get("aws_accounts"):
         rows = emit(providers.get("aws").fetch_by_service(cfg, end=end), "AWS", "USD")

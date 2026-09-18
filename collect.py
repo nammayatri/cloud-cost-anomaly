@@ -145,27 +145,34 @@ def _gcp_sections(cfg, target, source, cloud, label_prefix):
 
 
 def _vendor_section(cfg, target):
-    """The third-party vendor as a report section: one account, one row per module
-    across the 7-day window.
+    """The third-party vendor as a report section: one account, one row per
+    billing unit across the 7-day window.
 
     The vendor API is single-day, so the window is assembled with one call per day
-    (target-7 .. target — the WoW baseline needs day-7). Any failure (an expired
-    session token being the usual one) drops the vendor from the live report rather
-    than failing the run — the ClickHouse store is the durable record, this is
-    best-effort presentation.
+    (target-7 .. target — the WoW baseline needs day-7). Each day is fetched and
+    priced independently (store.vendor_priced_day) — an unavailable day (the
+    vendor's log export has real gaps) is skipped and logged, not treated as a
+    reason to drop the whole section: the other 7 days are still worth showing.
+    Only a missing TARGET day (nothing to report for the day this report is
+    actually about) empties the section.
     """
+    import store
     import vendor_billing
     if not vendor_billing.configured(cfg):
         return []
     label = cfg.get("vendor_account_label") or "Vendor"
     window = [target - timedelta(days=i) for i in range(WINDOW_DAYS)] + [target - timedelta(days=7)]
     per_day = {}
-    try:
-        for d in sorted(set(window)):
-            per_day[d] = {r["service"]: r["cost"] for r in vendor_billing.fetch_day(cfg, d)}
-    except Exception as e:
-        log.error("Vendor billing fetch failed — omitting from the live report: %s", e)
-        return []
+    unavailable = []
+    for d in sorted(set(window)):
+        hits = store.vendor_priced_day(cfg, d)
+        if hits is None:
+            unavailable.append(d)
+            continue
+        per_day[d] = {r["service"]: r["cost"] for r in hits}
+    if unavailable:
+        log.warning("Vendor log unavailable for %d day(s) in the report window: %s",
+                    len(unavailable), ", ".join(d.isoformat() for d in unavailable))
     if not per_day.get(target):
         return []
 

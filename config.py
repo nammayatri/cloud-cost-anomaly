@@ -111,9 +111,12 @@ _DEFAULTS = {
     "vendor_logs_api_url": None,         # POST {"date": "YYYY-MM-DD"} -> presigned CSV url
     "vendor_app_id": None,               # "appid" request header
     "vendor_app_key": None,              # "appKey" request header — secret
-    # Price per request, keyed by endpoint path exactly as logged minus any query
-    # string (e.g. "/v1/readId"), in report_currency. An endpoint with no entry
-    # here still shows up in the report at zero cost — see vendor_billing.py.
+    # Monthly-cumulative slab pricing, keyed by BILLING UNIT (not endpoint — one
+    # endpoint can bill under more than one unit, see vendor_billing._ENDPOINT_UNITS),
+    # in report_currency. Each value is a list of [lo, hi_or_null, price] tiers,
+    # 1-indexed inclusive request ranges for the month (hi=null = open-ended top
+    # tier). A unit with no entry here still shows up in the report at zero cost
+    # — see vendor_billing.py.
     "vendor_pricing": {},
     "vendor_account_label": "Vendor",    # account-column label
     "vendor_type": "Data and Tools",     # `type` grouping for these rows
