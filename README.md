@@ -33,6 +33,20 @@ Cloud billing surprises usually arrive on the **first of next month** — by the
 
 ## 🧠 What the report contains
 
+### Cost bases
+
+Every total is reported on two bases whenever credits are non-zero:
+
+* **Usage basis** — what the usage costs after commitment and negotiated discounts,
+  before promotional credits. GCP excludes `credits.type = 'PROMOTION'` and the
+  `Invoice / Contract billing adjustment` rows; AWS uses `UnblendedCost`. Every
+  percentage, the movers ranking and the budget comparison use this basis, so a
+  promotion starting or expiring never looks like a usage change.
+* **Invoiced** — the billed figure after every credit. GCP `cost + all credits`,
+  AWS `NetUnblendedCost`.
+
+With no credits in play the two are identical and only one column is shown.
+
 The run targets **T-2 (the day before yesterday)**, not T-1. Both AWS and GCP restate billing rows for roughly 24–48h after the usage day, and GCP is the slower of the two. Reporting T-1 means routinely publishing partial numbers that produce phantom drops which vanish overnight — the fastest way to teach a channel to ignore a bot. One extra day of latency buys numbers that never move after the fact.
 
 **Slack message** — the headline: spend per cloud with contribution %, total, ride count, and cost-per-ride against goal. Then a per-account roll-up, and a threaded reply listing the biggest day-over-day increases (ranked by *money moved*, not percent — a 400% jump on a ₹20 service is trivia).

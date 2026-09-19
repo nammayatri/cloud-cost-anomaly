@@ -187,29 +187,37 @@ def build_root_blocks(cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
     vendor_total = t["by_cloud"].get("VENDOR", 0.0)
     cloud_budget = sum(v for c, v in budgets.items() if c not in _NAMED and v)
 
+    show_inv = _any_credits(cfg, report["sections"])
+    inv_by_cloud = t["by_cloud_invoiced"]
+    cloud_inv = sum(v for c, v in inv_by_cloud.items() if c not in _NAMED)
+    maps_inv = inv_by_cloud.get("GMP", 0.0)
+    vendor_inv = inv_by_cloud.get("VENDOR", 0.0)
+
     entries = []
     for cloud in _cloud_order(report):
         if cloud in _NAMED:
             continue
         entries.append((f"{_cloud_name(cloud)} All Accounts", t["by_cloud"][cloud],
-                        budgets.get(cloud)))
+                        budgets.get(cloud), inv_by_cloud.get(cloud, 0.0)))
     if maps_total:
-        entries.append(("Maps Total", maps_total, (budgets.get("GMP") or None)))
+        entries.append(("Maps Total", maps_total, (budgets.get("GMP") or None), maps_inv))
     if vendor_total:
-        entries.append((f"{vendor_label} Total", vendor_total, (budgets.get("VENDOR") or None)))
+        entries.append((f"{vendor_label} Total", vendor_total,
+                        (budgets.get("VENDOR") or None), vendor_inv))
     grand = cloud_total + maps_total + vendor_total
     entries.append(("Total", grand,
-                    (cloud_budget + (budgets.get("GMP") or 0) + (budgets.get("VENDOR") or 0)) or None))
+                    (cloud_budget + (budgets.get("GMP") or 0) + (budgets.get("VENDOR") or 0)) or None,
+                    cloud_inv + maps_inv + vendor_inv))
 
     # The goal is shown as a DAILY figure (monthly budget / projection days) so it
     # sits in the same units as the cost beside it. Comparing a day's spend to a
     # monthly budget in the same row invites a 30x misreading.
     rows = []
-    for label, val, budget in entries:
+    for label, val, budget, invoiced in entries:
         daily_goal = (budget / days) if budget else None
         pct = ((val - daily_goal) / daily_goal * 100.0) if daily_goal else None
         diff = (val - daily_goal) if daily_goal else None
-        rows.append([
+        row = [
             label,
             money.fmt(cfg, val),
             money.fmt(cfg, daily_goal) if daily_goal else "-",
@@ -217,7 +225,14 @@ def build_root_blocks(cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
             # whether the gap is worth chasing.
             (("+" if diff > 0 else "") + money.fmt(cfg, diff) + f" ({pct:+.0f}%)")
             if daily_goal else "-",
-        ])
+        ]
+        if show_inv:
+            row.insert(2, money.fmt(cfg, invoiced))
+        rows.append(row)
+
+    headers = ["Account", "Current", "Goal/day", "Rate"]
+    if show_inv:
+        headers.insert(2, "Invoiced")
     # A one-line verdict above the table. Emoji live outside the code block on
     # purpose — inside it they are double-width and shear the column alignment.
     total_budget = sum(v for v in budgets.values() if v)
@@ -232,8 +247,7 @@ def build_root_blocks(cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
                    f"{money.fmt(cfg, abs(over))}/month {'above' if over > 0 else 'below'} plan")
         body.append({"type": "section", "text": {"type": "mrkdwn", "text": verdict}})
     body.append({"type": "section", "text": {"type": "mrkdwn",
-        "text": "```\n" + _mono_table(["Account", "Current", "Goal/day", "Rate"], rows)
-                + "\n```"}})
+        "text": "```\n" + _mono_table(headers, rows) + "\n```"}})
 
     # Mentions last: the numbers are what the reader came for, and a row of pings
     # above them is just a wall to scroll past. Position has no effect on whether
@@ -264,18 +278,40 @@ def _account_split_blocks(cfg: dict, report: dict, clouds, title: str) -> list[d
     if not secs:
         return []
     rc = cfg["report_currency"]
-    dec = 0 if rc == "INR" else 2
-    rows = [[_display(s, report), _num(s["total_report"], dec),
-             _amount_pct(s["prev_total_report"], s["dod_pct"], dec),
-             _amount_pct(s["lw_total_report"], s["wow_pct"], dec)] for s in secs]
+    dec = _dec(cfg)
+    show_inv = _any_credits(cfg, secs)
+    rows = []
+    for s in secs:
+        row = [_display(s, report), _num(s["total_report"], dec),
+               _amount_pct(s["prev_total_report"], s["dod_pct"], dec),
+               _amount_pct(s["lw_total_report"], s["wow_pct"], dec)]
+        if show_inv:
+            row.insert(2, _num(s["total_invoiced_report"], dec))
+        rows.append(row)
     total = sum(s["total_report"] for s in secs)
     prev = sum(s["prev_total_report"] for s in secs)
     lw = sum(s["lw_total_report"] for s in secs)
-    rows.append(["TOTAL", _num(total, dec),
+    total_row = ["TOTAL", _num(total, dec),
                  _amount_pct(prev, _pct_of(total, prev), dec),
-                 _amount_pct(lw, _pct_of(total, lw), dec)])
-    return _chunk_code_blocks(
-        title, _mono_table(["Account", f"cost{rc}", "vs prev day", "vs last week"], rows))
+                 _amount_pct(lw, _pct_of(total, lw), dec)]
+    if show_inv:
+        total_row.insert(2, _num(sum(s["total_invoiced_report"] for s in secs), dec))
+    rows.append(total_row)
+    headers = ["Account", f"cost{rc}", "vs prev day", "vs last week"]
+    if show_inv:
+        headers.insert(2, "Invoiced")
+    return _chunk_code_blocks(title, _mono_table(headers, rows))
+
+
+def _dec(cfg: dict) -> int:
+    """Decimal places for the reporting currency — rupees whole, others to paise."""
+    return 0 if cfg["report_currency"] == "INR" else 2
+
+
+def _any_credits(cfg: dict, sections) -> bool:
+    """True when any scope in this table had credits worth showing."""
+    return any(collect.credits_visible(s["total_report"], s["total_invoiced_report"], _dec(cfg))
+               for s in sections)
 
 
 def _pct_of(curr, base):
@@ -289,31 +325,46 @@ def _runrate_blocks(cfg: dict, report: dict) -> list[dict]:
     if not proj:
         return []
     days = int(cfg.get("projection_days") or 30)
-    rows = [[e["label"], money.fmt(cfg, e["projected"]),
-             money.fmt(cfg, e["budget"]) if e["budget"] else "-",
-             # Signed amount as well as percent: "+136%" on a small budget and
-             # "+10%" on a large one can be the same rupees, and the rupees are
-             # what actually has to be found.
-             (("+" if e["diff"] > 0 else "") + money.fmt(cfg, e["diff"]))
-             if e.get("diff") is not None else "-",
-             f"{e['pct']:+.0f}%" if e["pct"] is not None else "-",
-             ("OVER" if e["pct"] > 0 else "under") if e["pct"] is not None else ""]
-            for e in proj]
-    return _chunk_code_blocks(
-        f"*Monthly run-rate* _(today x {days})_",
-        _mono_table(["Bucket", "Projected", "Budget", "Over/under", "vs Budget", ""], rows))
+    show_inv = _any_credits(cfg, report["sections"])
+    rows = []
+    for e in proj:
+        row = [e["label"], money.fmt(cfg, e["projected"]),
+               money.fmt(cfg, e["budget"]) if e["budget"] else "-",
+               # Signed amount as well as percent: "+136%" on a small budget and
+               # "+10%" on a large one can be the same rupees, and the rupees are
+               # what actually has to be found.
+               (("+" if e["diff"] > 0 else "") + money.fmt(cfg, e["diff"]))
+               if e.get("diff") is not None else "-",
+               f"{e['pct']:+.0f}%" if e["pct"] is not None else "-",
+               ("OVER" if e["pct"] > 0 else "under") if e["pct"] is not None else ""]
+        if show_inv:
+            row.insert(2, money.fmt(cfg, e["projected_invoiced"]))
+        rows.append(row)
+    headers = ["Bucket", "Projected", "Budget", "Over/under", "vs Budget", ""]
+    if show_inv:
+        headers.insert(2, "Invoiced")
+    return _chunk_code_blocks(f"*Monthly run-rate* _(today x {days})_", _mono_table(headers, rows))
 
 
 def _per_ride_blocks(cfg: dict, report: dict) -> list[dict]:
     econ = collect.unit_economics(cfg, report)
     if not econ:
         return []
-    rows = [[e["label"], money.fmt(cfg, e["cost"]), f"{e['rides']:,}",
-             money.fmt(cfg, e["per_ride"], decimals=2)] for e in econ]
+    show_inv = _any_credits(cfg, report["sections"])
+    rows = []
+    for e in econ:
+        row = [e["label"], money.fmt(cfg, e["cost"]), f"{e['rides']:,}",
+               money.fmt(cfg, e["per_ride"], decimals=2)]
+        if show_inv:
+            row.append(money.fmt(cfg, e["per_ride_invoiced"], decimals=2)
+                       if e.get("per_ride_invoiced") is not None else "-")
+        rows.append(row)
+    headers = ["Basis", "Cost", "Rides", "Per ride"]
+    if show_inv:
+        headers.append("Per ride (inv)")
     rides = report["rides"]
     src = "  ·  ".join(f"{k}: {v:,}" for k, v in (rides.get("by_source") or {}).items())
-    blocks = _chunk_code_blocks("*Cost per ride*",
-                                _mono_table(["Basis", "Cost", "Rides", "Per ride"], rows))
+    blocks = _chunk_code_blocks("*Cost per ride*", _mono_table(headers, rows))
     if src:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": src}]})
     return blocks
@@ -342,9 +393,16 @@ def _section_table_blocks(cfg: dict, report: dict, section: dict, limit: int = 2
     if len(rows) < len(section["rows"]):
         # Never let a cap read as full coverage.
         title += f"  _(top {len(rows)} of {len(section['rows'])}; full list in the workbook)_"
-    return _chunk_code_blocks(
+    blocks = _chunk_code_blocks(
         title,
         _mono_table(["Service", f"cost{rc}", "vs prev day", "vs last week"], rows))
+    # The grid stays single-basis — seven day columns plus two comparisons is
+    # already at the width a phone can read — so credits are stated once, here.
+    if collect.credits_visible(section["total_report"], section["total_invoiced_report"], dec):
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+            "text": f"credits applied: -{_num(section['credits_report'], dec)}"
+                    f"  →  invoiced {_num(section['total_invoiced_report'], dec)}"}]})
+    return blocks
 
 
 def _gmp_table_blocks(cfg: dict, report: dict, limit: int = 20) -> list[dict]:
