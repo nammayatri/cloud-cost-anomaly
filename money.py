@@ -128,5 +128,9 @@ def fmt(cfg: dict, amount: float, code: str | None = None,
     code = code or cfg["report_currency"]
     if decimals is None:
         decimals = 0 if code == "INR" else 2
+    # A sum of credits against their own costs lands on -0.0 (or a femto-rupee
+    # residue), which would print as "-₹0". Anything that rounds to zero is zero.
+    if round(amount, decimals) == 0:
+        amount = 0.0
     sign = "-" if amount < 0 else ""
     return f"{sign}{symbol(code)}{abs(amount):,.{decimals}f}"

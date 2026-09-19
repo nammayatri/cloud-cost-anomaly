@@ -61,8 +61,11 @@ def _account(section_label: str) -> str:
 
 def _row(day: date, cloud: str, account: str, service: str,
          cost_native: float, currency: str, fx_rate: float,
-         units: float | None = None, type_head: tuple | None = None) -> dict:
+         units: float | None = None, type_head: tuple | None = None,
+         cost_invoiced_native: float | None = None) -> dict:
     typ, head = type_head or _CLOUD_MAP.get(cloud, ("Other", cloud))
+    # No credits on this source (the vendor bill) => invoiced equals usage.
+    invoiced = cost_native if cost_invoiced_native is None else cost_invoiced_native
     return {
         "date": day.isoformat(),
         "type": typ,
@@ -73,6 +76,8 @@ def _row(day: date, cloud: str, account: str, service: str,
         "currency": currency,
         "fx_rate": round(fx_rate, 6),
         "cost_inr": round(cost_native * fx_rate, 6),
+        "cost_native_invoiced": round(invoiced, 6),
+        "cost_inr_invoiced": round(invoiced * fx_rate, 6),
         "units": units,
     }
 
@@ -161,10 +166,49 @@ def _vendor_rows(cfg: dict, day) -> list[dict]:
                  cfg["report_currency"], 1.0, units=h.get("units"), type_head=th) for h in hits]
 
 
+_COLUMNS_CACHE: dict[str, set[str]] = {}
+
+
+def _table_columns(cfg: dict) -> set[str]:
+    """Column names of the target table, read once per process.
+
+    Lets the code ship before the invoiced columns are added: rows are filtered to
+    what the table actually has, so a pre-migration table takes the same write it
+    always did instead of failing with UNKNOWN_IDENTIFIER.
+    """
+    db = cfg.get("cost_ch_database", "cost_analytics")
+    tbl = cfg.get("cost_ch_table", "cost_daily")
+    key = f"{db}.{tbl}"
+    if key in _COLUMNS_CACHE:
+        return _COLUMNS_CACHE[key]
+    scheme = "https" if cfg.get("cost_ch_secure") else "http"
+    url = (f"{scheme}://{cfg['cost_ch_host']}:{cfg.get('cost_ch_port', 8123)}/"
+           f"?query=" + urllib.parse.quote(f"SELECT name FROM system.columns "
+                                           f"WHERE database = '{db}' AND table = '{tbl}'"))
+    req = urllib.request.Request(url, headers={
+        "X-ClickHouse-User": cfg["cost_ch_user"],
+        "X-ClickHouse-Key": cfg["cost_ch_password"],
+    })
+    resp = urllib.request.urlopen(req, timeout=_TIMEOUT)
+    cols = {line.strip() for line in resp.read().decode().splitlines() if line.strip()}
+    _COLUMNS_CACHE[key] = cols
+    return cols
+
+
 def _insert(cfg: dict, rows: list[dict]) -> int:
     """Bulk INSERT via JSONEachRow. Returns the number of rows written."""
     if not rows:
         return 0
+    try:
+        cols = _table_columns(cfg)
+    except Exception as e:
+        # Probe failure must not lose the write; send every key and let ClickHouse
+        # decide. A pre-migration table then fails loudly, which is the right signal.
+        log.warning("Could not read %s columns (%s) — inserting all fields",
+                    cfg.get("cost_ch_table", "cost_daily"), e)
+        cols = None
+    if cols:
+        rows = [{k: v for k, v in r.items() if k in cols} for r in rows]
     db = cfg.get("cost_ch_database", "cost_analytics")
     tbl = cfg.get("cost_ch_table", "cost_daily")
     scheme = "https" if cfg.get("cost_ch_secure") else "http"
@@ -201,7 +245,8 @@ def _rows_from_report(cfg: dict, report: dict) -> list[dict]:
             if not r["today"]:
                 continue
             rows.append(_row(day, s["cloud"], s["label"], r["service"],
-                             r["today"], s["currency"], fx))
+                             r["today"], s["currency"], fx,
+                             cost_invoiced_native=r["today_invoiced"]))
     return rows
 
 
@@ -321,18 +366,22 @@ def backfill(cfg: dict, start: date, end: date) -> dict:
 
     def emit(scoped: dict, cloud: str, currency: str) -> list[dict]:
         out = []
-        for label, df in scoped.items():
-            for day in df.index:
+        for label, fr in scoped.items():
+            usage, inv = fr["usage"], fr["invoiced"]
+            for day in usage.index:
                 if not (start <= day < end):
                     continue
                 r = rate_for(day, currency)
-                for svc in df.columns:
+                for svc in usage.columns:
                     if svc == "Total":
                         continue
-                    v = float(df.at[day, svc])
+                    v = float(usage.at[day, svc])
                     if not v:
                         continue
-                    out.append(_row(day, cloud, label, svc, v, currency, r))
+                    iv = float(inv.at[day, svc]) if (day in inv.index
+                                                     and svc in inv.columns) else v
+                    out.append(_row(day, cloud, label, svc, v, currency, r,
+                                    cost_invoiced_native=iv))
         return out
 
     counts: dict[str, int] = {}

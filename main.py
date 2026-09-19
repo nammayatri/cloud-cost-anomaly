@@ -69,10 +69,19 @@ def _print_summary(cfg: dict, report: dict, path: str) -> None:
     t = report["totals"]
     print(f"\nReport for {report['date']}  (workbook: {path})")
     print("-" * 72)
+    dec = 0 if cfg["report_currency"] == "INR" else 2
+    show_inv = any(collector.credits_visible(s["total_report"], s["total_invoiced_report"], dec)
+                   for s in report["sections"])
     for b in t["buckets"]:
         share = (b["total"] / t["grand_total"] * 100.0) if t["grand_total"] else 0.0
-        print(f"  {b['label']:<28} {money.fmt(cfg, b['total']):>16}  ({share:5.2f}%)")
-    print(f"  {'Total Cloud Costs':<28} {money.fmt(cfg, t['grand_total']):>16}")
+        line = f"  {b['label']:<28} {money.fmt(cfg, b['total']):>16}  ({share:5.2f}%)"
+        if show_inv:
+            line += f"   invoiced {money.fmt(cfg, b['total_invoiced'])}"
+        print(line)
+    total_line = f"  {'Total Cloud Costs':<28} {money.fmt(cfg, t['grand_total']):>16}"
+    if show_inv:
+        total_line += f"   invoiced {money.fmt(cfg, t['grand_total_invoiced'])}"
+    print(total_line)
     rides = report.get("rides")
     if rides and rides.get("total"):
         print(f"  {'Total Rides':<28} {rides['total']:>16,}")
