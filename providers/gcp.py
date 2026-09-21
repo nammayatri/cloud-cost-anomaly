@@ -6,9 +6,10 @@ Mirrors the AWS provider's contract, but GCP differs in ways that matter:
     Every query MUST filter project.id, or you report other projects' spend as
     your own. `gcp_projects` is required for exactly this reason.
   * Cost is reported gross; credits (CUD/SUD/promos/discounts) arrive in a
-    repeated `credits` field. Net = cost + SUM(credits.amount) — credit amounts
-    are already negative. Net is what actually gets invoiced, so that's what we
-    report.
+    repeated `credits` field, with negative amounts. We report cost + credits
+    EXCEPT promotions: a promotional grant can cover the entire invoice (one
+    started 2026-09-15), which drives the invoiced total to zero and makes every
+    service look free. See _USAGE_COST.
   * Currency is the billing account's, not USD.
   * Rows are restated for ~24-48h after the usage day. The table is partitioned
     on _PARTITIONTIME (INGEST time), which is NOT the usage day: a restatement
@@ -60,8 +61,25 @@ def _client(cfg: dict) -> bigquery.Client:
     return bigquery.Client(project=cfg.get("gcp_project") or None)
 
 
-# cost + credits => net. Credit amounts are negative, so this subtracts.
-_NET_COST = "SUM(cost + IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) AS c), 0))"
+# cost + credits => what the usage costs. Credit amounts are negative, so this
+# subtracts.
+#
+# PROMOTION credits are excluded. They are billing-account-wide grants that cover
+# the whole invoice — the current one started 2026-09-15 — so including them
+# reports every service at ~0 and hides real movement. Everything that reflects
+# what the usage actually costs (COMMITTED_USAGE_DISCOUNT, DISCOUNT, SUD) is kept.
+#
+# The `Invoice / Contract billing adjustment` row must be dropped with them: it is
+# a positive cost line carrying an exactly offsetting PROMOTION credit, so once
+# promotions are excluded it would inflate the total by that same amount
+# (₹19k-36k/day in Sept 2026).
+_USAGE_COST = """SUM(IF(service.description = 'Invoice', 0,
+            cost + IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) AS c
+                           WHERE c.type != 'PROMOTION'), 0)))"""
+
+# Invoiced: cost after EVERY credit, including promotions, and including the
+# Invoice adjustment row. This is the number finance sees on the bill.
+_INVOICED_COST = "SUM(cost + IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) AS c), 0))"
 
 
 def _run(cfg: dict, sql: str, params: list) -> pd.DataFrame:
@@ -73,8 +91,19 @@ def _run(cfg: dict, sql: str, params: list) -> pd.DataFrame:
     return job.result().to_dataframe()
 
 
-def fetch_by_service(cfg: dict, end: date | None = None, source: str = "gcp") -> dict[str, pd.DataFrame]:
-    """Daily net cost by service, per project, for the trailing lookback_days ending at `end` (exclusive)."""
+def _pivot(sub, value_col: str):
+    """Long rows -> date-indexed frame, one column per service, plus 'Total'."""
+    pivot = sub.pivot_table(index="day", columns="service", values=value_col,
+                            aggfunc="sum").fillna(0.0)
+    pivot.index = pd.to_datetime(pivot.index).date
+    pivot = pivot.sort_index()
+    pivot["Total"] = pivot.sum(axis=1)
+    return pivot
+
+
+def fetch_by_service(cfg: dict, end: date | None = None, source: str = "gcp") -> dict[str, dict]:
+    """Daily cost by service, per project, on both bases, for the trailing
+    lookback_days ending at `end` (exclusive)."""
     end = end or date.today()
     start = end - timedelta(days=cfg["lookback_days"])
     table, projects = _source(cfg, source)
@@ -84,7 +113,8 @@ def fetch_by_service(cfg: dict, end: date | None = None, source: str = "gcp") ->
           project.id            AS project,
           service.description   AS service,
           DATE(usage_start_time) AS day,
-          {_NET_COST}           AS cost
+          {_USAGE_COST}         AS cost,
+          {_INVOICED_COST}      AS cost_invoiced
         FROM `{table}`
         WHERE _PARTITIONTIME >= TIMESTAMP(@start)
           AND DATE(usage_start_time) >= @start
@@ -101,17 +131,49 @@ def fetch_by_service(cfg: dict, end: date | None = None, source: str = "gcp") ->
     if df.empty:
         return {}
 
-    out: dict[str, pd.DataFrame] = {}
+    out: dict[str, dict] = {}
     for project in projects:  # iterate the configured order, not what BQ returned
         sub = df[df["project"] == project]
         if sub.empty:
             continue
-        pivot = sub.pivot_table(index="day", columns="service", values="cost", aggfunc="sum").fillna(0.0)
-        pivot.index = pd.to_datetime(pivot.index).date
-        pivot = pivot.sort_index()
-        pivot["Total"] = pivot.sum(axis=1)
-        out[project] = pivot
+        out[project] = {
+            "usage": _pivot(sub, "cost"),
+            "invoiced": _pivot(sub, "cost_invoiced"),
+        }
     return out
+
+
+def fetch_account_daily(cfg: dict, end: date | None = None, source: str = "gcp") -> pd.DataFrame:
+    """Daily cost for the WHOLE billing account — every project, configured or not.
+
+    `fetch_by_service` deliberately filters to `gcp_projects`, so anything billed to
+    a project nobody listed is invisible. This is the account-level total to
+    reconcile against the invoice, and to catch spend in a project that was never
+    added to the config.
+
+    Returns a DataFrame of (day, billing_account_id, cost), oldest day first.
+    """
+    end = end or date.today()
+    start = end - timedelta(days=cfg["lookback_days"])
+    table, _ = _source(cfg, source)
+
+    sql = f"""
+        SELECT
+          DATE(usage_start_time) AS day,
+          billing_account_id     AS billing_account_id,
+          {_USAGE_COST}          AS cost
+        FROM `{table}`
+        WHERE _PARTITIONTIME >= TIMESTAMP(@start)
+          AND DATE(usage_start_time) >= @start
+          AND DATE(usage_start_time) <  @end
+        GROUP BY day, billing_account_id
+        ORDER BY day
+    """
+    params = [
+        bigquery.ScalarQueryParameter("start", "DATE", start),
+        bigquery.ScalarQueryParameter("end", "DATE", end),
+    ]
+    return _run(cfg, sql, params)
 
 
 def fetch_api_usage(cfg: dict, day: date, source: str = "gmp") -> pd.DataFrame:
@@ -128,7 +190,7 @@ def fetch_api_usage(cfg: dict, day: date, source: str = "gmp") -> pd.DataFrame:
     sql = f"""
         SELECT
           service.description                 AS service,
-          {_NET_COST}                         AS cost,
+          {_USAGE_COST}                       AS cost,
           SUM(usage.amount_in_pricing_units)  AS requests
         FROM `{table}`
         WHERE _PARTITIONTIME >= TIMESTAMP(@day)

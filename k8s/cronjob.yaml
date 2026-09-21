@@ -133,6 +133,30 @@ spec:
                   value: "<XYNE_HOST>"
                 - name: XYNE_CHANNEL
                   value: "<XYNE_CHANNEL>"
+                - name: VENDOR_LOGS_API_URL
+                  value: "https://billing-dashboard.hyperverge.co/v1/logs/module/daily"
+                - name: VENDOR_APP_ID
+                  value: "<VENDOR_APP_ID>"
+                # JSON object: billing unit code (not endpoint — see
+                # vendor_billing._ENDPOINT_UNITS) -> monthly-cumulative slab
+                # tiers [lo, hi_or_null, price], in REPORT_CURRENCY. Real
+                # prices are commercial terms — keep zeros here, apply the
+                # real rate card to the live Secret/CronJob directly, never
+                # commit it.
+                - name: VENDOR_PRICING
+                  value: |
+                    {
+                      "ocr": [[0, 200000, 0], [200001, 500000, 0], [500001, null, 0]],
+                      "ocrQualityCheck": [[0, 200000, 0], [200001, 500000, 0], [500001, null, 0]],
+                      "facematch": [[0, 200000, 0], [200001, 500000, 0], [500001, null, 0]],
+                      "aadhaarMasking": [[0, null, 0]],
+                      "async_RCVerification": [[0, 200000, 0], [200001, 500000, 0], [500001, null, 0]],
+                      "liveness": [[0, 200000, 0], [200001, 500000, 0], [500001, null, 0]],
+                      "livenessQualityCheck": [[0, 200000, 0], [200001, 500000, 0], [500001, null, 0]],
+                      "textMatch": [[0, 200000, 0], [200001, 500000, 0], [500001, null, 0]],
+                      "central_db_check": [[0, 200000, 0], [200001, 500000, 0], [500001, null, 0]],
+                      "async_checkDL": [[0, 200000, 0], [200001, 500000, 0], [500001, null, 0]]
+                    }
               envFrom:
                 - secretRef:
                     name: cost-report-secret
