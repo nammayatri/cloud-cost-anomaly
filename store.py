@@ -45,6 +45,18 @@ _CLOUD_MAP = {
 }
 
 
+def cloud_for(type_: str, cost_head: str) -> str | None:
+    """Inverse of _CLOUD_MAP: the report's cloud key for a stored row's taxonomy.
+
+    Exposed so budgets.py can map table rows back to cloud keys without either
+    module owning a second copy of the mapping.
+    """
+    for cloud, pair in _CLOUD_MAP.items():
+        if pair == (type_, cost_head):
+            return cloud
+    return None
+
+
 def configured(cfg: dict) -> bool:
     return bool(cfg.get("cost_ch_host") and cfg.get("cost_ch_user")
                and cfg.get("cost_ch_password"))

@@ -98,7 +98,7 @@ All settings come from **either** environment variables **or** `config.json`. En
 | `clickhouse_database` | `CLICKHOUSE_DATABASE` | `default` | Queries are fully qualified, so this rarely matters |
 | `ride_query_dir` | `RIDE_QUERY_DIR` | — | Directory of `*.sql` ride queries. Unset skips ride metrics |
 | `primary_ride_source` | `PRIMARY_RIDE_SOURCE` | first file | Which source is the base ride count; others are additive |
-| `monthly_budgets` | `MONTHLY_BUDGETS` | `{}` | JSON, per cloud (`AWS`/`GCP`/`GMP`), in the reporting currency |
+| `monthly_budgets` | `MONTHLY_BUDGETS` | `{}` | JSON, per cloud (`AWS`/`GCP`/`GMP`), in the reporting currency. **Fallback only** — see Budgets below |
 | `projection_days` | `PROJECTION_DAYS` | `30` | Days used for the run-rate projection |
 | `mention` | `MENTION` | empty | `here`, `channel`, user ID (`U…`), usergroup ID (`S…`) |
 | `xyne_base_url` | `XYNE_BASE_URL` | — | Optional second destination. All three Xyne keys must be set or it is skipped |
@@ -108,6 +108,29 @@ All settings come from **either** environment variables **or** `config.json`. En
 | `vendor_logs_api_url` | `VENDOR_LOGS_API_URL` | — | Third-party verification vendor's daily request-logs endpoint. Omit to skip the vendor entirely |
 | `vendor_app_id` / `vendor_app_key` | `VENDOR_APP_ID` / `VENDOR_APP_KEY` | — | Vendor API credentials (`appid` / `appKey` headers). Key is a secret |
 | `vendor_pricing` | `VENDOR_PRICING` | `{}` | JSON, keyed by billing UNIT (not endpoint — see `vendor_billing._ENDPOINT_UNITS`); each value a list of `[lo, hi_or_null, price]` monthly-cumulative slab tiers, in `report_currency` |
+
+### Budgets
+
+Budgets live in ClickHouse (`cost_analytics.cost_budget`, DDL in `ddl/cost_budget.sql`) so finance
+can change a number without a redeploy, and so this report and the Control Center cost dashboard
+cannot disagree about the target. `MONTHLY_BUDGETS` stays as the fallback: if the table is
+unreachable or empty, the configured value is used and the run carries on.
+
+Two resolution rules:
+
+* **Carry-forward** — a month with no row inherits the most recent earlier month, so a budget is
+  entered once rather than re-entered monthly.
+* **Cost-head level wins** — a row with an empty `account` is the budget for the whole cost head.
+  Account-level rows exist for the dashboard's finer breakdown; this report falls back to summing
+  them only when no cost-head row exists.
+
+Change a budget by inserting a new row for that month — `ReplacingMergeTree` keeps the newest
+`updated_at`:
+
+```sql
+INSERT INTO cost_analytics.cost_budget (month, type, cost_head, account, budget_inr, updated_by)
+VALUES ('2026-10-01', 'Cloud', 'GCP Cost', '', 3200000, 'finance:<name>');
+```
 
 ## 🔐 IAM
 
