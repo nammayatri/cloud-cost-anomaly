@@ -104,6 +104,8 @@ All settings come from **either** environment variables **or** `config.json`. En
 | `xyne_base_url` | `XYNE_BASE_URL` | — | Optional second destination. All three Xyne keys must be set or it is skipped |
 | `xyne_jwt` | `XYNE_JWT` | — | App JWT. Needs `chat:write` and `files:write` |
 | `xyne_channel` | `XYNE_CHANNEL` | — | Channel **name without** a leading `#` |
+| `xyne_weekly_only` | `XYNE_WEEKLY_ONLY` | `true` | Post to Xyne only when the cron runs on a Monday; Slack is unaffected |
+| `control_center_dashboard` | `CONTROL_CENTER_DASHBOARD` | — | Optional link appended to the end of the Xyne message |
 | `lookback_days` | `LOOKBACK_DAYS` | `21` | History pulled (must be ≥ 8 for the WoW column) |
 | `vendor_logs_api_url` | `VENDOR_LOGS_API_URL` | — | Third-party verification vendor's daily request-logs endpoint. Omit to skip the vendor entirely |
 | `vendor_app_id` / `vendor_app_key` | `VENDOR_APP_ID` / `VENDOR_APP_KEY` | — | Vendor API credentials (`appid` / `appKey` headers). Key is a secret |

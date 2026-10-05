@@ -44,6 +44,8 @@
   "xyne_base_url": "https://<xyne-host>",
   "xyne_jwt": "<app jwt from install/regenerate-jwt>",
   "xyne_channel": "<channel-name-without-hash>",
+  "xyne_weekly_only": true,
+  "control_center_dashboard": "https://control-center.moving.tech/analytics/executive-cost",
   "cost_ch_host": "<clickhouse-host>",
   "cost_ch_user": "<writer-user>",
   "cost_ch_password": "<writer-pass>",

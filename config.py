@@ -91,6 +91,13 @@ _DEFAULTS = {
     # Literal mention string prepended nowhere — appended to the Xyne root message.
     # Xyne has its own directory, so Slack user/group IDs do not carry over.
     "xyne_mention": None,
+    # Weekly instead of daily: Xyne only posts when the cron runs on a Monday
+    # (Slack is unaffected). Xyne's channel is lower-traffic than Slack's and
+    # wants a digest cadence, not a daily one.
+    "xyne_weekly_only": True,
+    # Optional link appended to the end of the Xyne root message, e.g. the
+    # Control Center dashboard. Omit to append nothing.
+    "control_center_dashboard": None,
 
     # --- Cost store (ClickHouse cost_analytics.cost_daily) ---
     # Optional. When set, each run persists the day's per-service cost for the
@@ -140,7 +147,7 @@ _LIST_KEYS = ("gcp_projects", "gmp_projects")
 # Env vars that carry structured data, as a JSON string.
 _JSON_KEYS = ("aws_accounts", "monthly_budgets", "vendor_pricing")
 
-_BOOL_KEYS = ("clickhouse_secure", "fx_fetch", "cost_ch_secure")
+_BOOL_KEYS = ("clickhouse_secure", "fx_fetch", "cost_ch_secure", "xyne_weekly_only")
 
 _TRUTHY = {"1", "true", "yes", "on"}
 

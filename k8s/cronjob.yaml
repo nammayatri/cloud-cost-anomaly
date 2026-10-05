@@ -133,6 +133,12 @@ spec:
                   value: "<XYNE_HOST>"
                 - name: XYNE_CHANNEL
                   value: "<XYNE_CHANNEL>"
+                # Xyne posts weekly (Mondays only) by default; Slack stays daily.
+                - name: XYNE_WEEKLY_ONLY
+                  value: "true"
+                # Optional link appended to the end of the Xyne message.
+                - name: CONTROL_CENTER_DASHBOARD
+                  value: "https://control-center.moving.tech/analytics/executive-cost"
                 - name: VENDOR_LOGS_API_URL
                   value: "https://billing-dashboard.hyperverge.co/v1/logs/module/daily"
                 - name: VENDOR_APP_ID
