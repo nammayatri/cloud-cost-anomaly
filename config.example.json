@@ -38,6 +38,7 @@
   },
   "projection_days": 30,
   "slack_bot_token": "xoxb-...",
+  "slack_enabled": true,
   "slack_channel_id": "C0XXXXXXXXX",
   "mention": "",
   "lookback_days": 21,

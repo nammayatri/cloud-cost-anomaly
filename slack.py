@@ -674,6 +674,9 @@ def post(cfg: dict, report: dict, xlsx_path: str) -> None:
     under it, then the workbook. Each image posts as an inline image block in a real
     message — that yields a reliable message ts to thread under (a raw file upload
     does not). Works with a channel #name or id."""
+    if not cfg.get("slack_enabled", True):
+        log.info("Slack disabled via config — skipping")
+        return
     client = WebClient(token=cfg["slack_bot_token"])
     d = report["date"]
     channel = cfg["slack_channel_id"]
