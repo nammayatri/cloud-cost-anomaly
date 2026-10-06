@@ -1,5 +1,6 @@
 import datetime as dt
 import json
+from unittest import mock
 
 import collect
 import slack
@@ -49,3 +50,19 @@ def test_service_table_gets_a_credits_footer_only_with_credits():
     without = _report(invoiced_today=100.0)
     blocks = slack._section_table_blocks(CFG, without, without["sections"][0])
     assert "credits applied" not in _text(blocks)
+
+
+def test_post_skips_without_touching_slack_when_disabled():
+    with mock.patch.object(slack, "WebClient") as mock_client:
+        slack.post({**CFG, "slack_enabled": False}, _report(0.0), "/tmp/wb.xlsx")
+    assert not mock_client.called
+
+
+def test_post_proceeds_when_enabled_by_default():
+    cfg = {**CFG, "slack_bot_token": "x", "slack_channel_id": "C1"}
+    with mock.patch.object(slack, "WebClient") as mock_client:
+        try:
+            slack.post(cfg, _report(0.0), "/tmp/wb.xlsx")
+        except Exception:
+            pass   # we only care whether it got as far as constructing the client
+    assert mock_client.called

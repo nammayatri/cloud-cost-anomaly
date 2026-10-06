@@ -81,6 +81,10 @@ _DEFAULTS = {
 
     "slack_bot_token": None,
     "slack_channel_id": None,
+    # Kill switch: the token/channel stay required (other things may depend on
+    # them being configured), but setting this false skips the actual post —
+    # everything else (ClickHouse write, Xyne) still runs normally.
+    "slack_enabled": True,
 
     # --- Xyne (Slack-compatible adapter) ---
     # Optional second destination. All three must be set or Xyne is skipped.
@@ -147,7 +151,7 @@ _LIST_KEYS = ("gcp_projects", "gmp_projects")
 # Env vars that carry structured data, as a JSON string.
 _JSON_KEYS = ("aws_accounts", "monthly_budgets", "vendor_pricing")
 
-_BOOL_KEYS = ("clickhouse_secure", "fx_fetch", "cost_ch_secure", "xyne_weekly_only")
+_BOOL_KEYS = ("clickhouse_secure", "fx_fetch", "cost_ch_secure", "xyne_weekly_only", "slack_enabled")
 
 _TRUTHY = {"1", "true", "yes", "on"}
 

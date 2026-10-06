@@ -82,6 +82,7 @@ All settings come from **either** environment variables **or** `config.json`. En
 |---|---|---|---|
 | `provider` | `PROVIDER` | `all` | `aws`, `gcp`, or `all` (the combined workbook) |
 | `slack_bot_token` | `SLACK_BOT_TOKEN` | — | **Required.** `xoxb-…` with `chat:write` **and `files:write`** |
+| `slack_enabled` | `SLACK_ENABLED` | `true` | Kill switch — `false` skips the Slack post only; ClickHouse write and Xyne still run |
 | `slack_channel_id` | `SLACK_CHANNEL_ID` | — | **Required.** Prefer the ID over `#name` |
 | `aws_accounts` | `AWS_ACCOUNTS` | `[]` | **JSON array.** One tab per entry: `{"label", "role_arn"?, "profile"?, "region"?}`. Omit `role_arn` to use ambient credentials |
 | `aws_region` | `AWS_REGION` | `ap-south-1` | Default region for CE clients |
