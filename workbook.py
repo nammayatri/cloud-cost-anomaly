@@ -136,6 +136,10 @@ def _summary_sheet(wb, styles, taken, cfg, report):
     mfmt = _money_formats(wb, styles, rc)
     pct = _pct_fmt(wb)
     rdec = 0 if rc == "INR" else 2
+    # One flag for the whole sheet: either credits are in play for this run or the
+    # extra column never appears.
+    show_inv = any(collect.credits_visible(s["total_report"], s["total_invoiced_report"], rdec)
+                   for s in report["sections"])
     cmp_fmt = wb.add_format({"align": "right"})
     d = report["date"]
     t = report["totals"]
@@ -229,8 +233,11 @@ def _summary_sheet(wb, styles, taken, cfg, report):
     proj = collect.monthly_projection(cfg, report)
     if proj:
         days = int(cfg.get("projection_days") or 30)
-        ws.write_row(r, 0, [f"Monthly run-rate (today x {days})", f"Projected ({rc})",
-                            f"Budget ({rc})", f"Over/under ({rc})", "vs Budget"], styles.header)
+        hdr = [f"Monthly run-rate (today x {days})", f"Projected ({rc})",
+               f"Budget ({rc})", f"Over/under ({rc})", "vs Budget"]
+        if show_inv:
+            hdr.insert(2, f"Invoiced ({rc})")
+        ws.write_row(r, 0, hdr, styles.header)
         r += 1
         over = wb.add_format({"num_format": "0.0%", "bold": True, "font_color": "#C0392B"})
         under = wb.add_format({"num_format": "0.0%", "font_color": "#1E8449"})
@@ -239,29 +246,41 @@ def _summary_sheet(wb, styles, taken, cfg, report):
             mny = mfmt["total"] if e.get("is_total") else mfmt["plain"]
             ws.write(r, 0, e["label"], lab); W.see(0, e["label"])
             ws.write_number(r, 1, e["projected"], mny); W.see(1, money.fmt(cfg, e["projected"]))
+            c = 2
+            if show_inv:
+                ws.write_number(r, c, e["projected_invoiced"], mny)
+                W.see(c, money.fmt(cfg, e["projected_invoiced"]))
+                c += 1
             if e["budget"]:
-                W.see(2, money.fmt(cfg, e["budget"])); W.see(3, money.fmt(cfg, e["diff"]))
-            if e["budget"]:
-                ws.write_number(r, 2, e["budget"], mny)
-                ws.write_number(r, 3, e["diff"], mny)
-                ws.write_number(r, 4, e["pct"] / 100.0, over if e["pct"] > 0 else under)
+                W.see(c, money.fmt(cfg, e["budget"])); W.see(c + 1, money.fmt(cfg, e["diff"]))
+                ws.write_number(r, c, e["budget"], mny)
+                ws.write_number(r, c + 1, e["diff"], mny)
+                ws.write_number(r, c + 2, e["pct"] / 100.0, over if e["pct"] > 0 else under)
             else:
-                ws.write(r, 2, "—", styles.text)
-                ws.write(r, 3, "—", styles.text)
-                ws.write(r, 4, "—", styles.text)
+                ws.write(r, c, "—", styles.text)
+                ws.write(r, c + 1, "—", styles.text)
+                ws.write(r, c + 2, "—", styles.text)
             r += 1
         r += 1
 
     # Per-tab roll-up so the summary alone answers "which account moved".
-    ws.write_row(r, 0, ["Account / Project", f"Cost ({rc})", "vs yesterday", "vs last week"], styles.header)
+    hdr = ["Account / Project", f"Cost ({rc})", "vs yesterday", "vs last week"]
+    if show_inv:
+        hdr.insert(2, f"Invoiced ({rc})")
+    ws.write_row(r, 0, hdr, styles.header)
     r += 1
     for s in sorted(report["sections"], key=lambda x: x["total_report"], reverse=True):
         ws.write(r, 0, s["label"], styles.text); W.see(0, s["label"])
         ws.write_number(r, 1, s["total_report"], mfmt["plain"])
+        c = 2
+        if show_inv:
+            ws.write_number(r, c, s["total_invoiced_report"], mfmt["plain"])
+            W.see(c, money.fmt(cfg, s["total_invoiced_report"]))
+            c += 1
         c2 = _amt_pct(s["prev_total_report"], s["dod_pct"], rdec)
         c3 = _amt_pct(s["lw_total_report"], s["wow_pct"], rdec)
-        ws.write(r, 2, c2, cmp_fmt); ws.write(r, 3, c3, cmp_fmt)
-        W.see(2, c2); W.see(3, c3)
+        ws.write(r, c, c2, cmp_fmt); ws.write(r, c + 1, c3, cmp_fmt)
+        W.see(c, c2); W.see(c + 1, c3)
         r += 1
 
     for hdr in ("Account", "Cost per ride — basis", "Monthly run-rate (today x 30)",
@@ -329,6 +348,10 @@ def _detail_sheet(wb, styles, taken, cfg, report, section):
     sub = f"Daily cost by service, in {native}."
     if not same_ccy:
         sub += f" Totals also shown in {rc} at {cfg['usd_inr_rate']:.4f}."
+    if collect.credits_visible(section["total_report"], section["total_invoiced_report"],
+                               0 if rc == "INR" else 2):
+        sub += (f"   ·   credits applied: -{money.fmt(cfg, section['credits_report'])}"
+                f"  →  invoiced {money.fmt(cfg, section['total_invoiced_report'])}")
     ws.write(1, 0, sub, styles.subtitle)
 
     day_fmt = wb.add_format({

@@ -37,6 +37,15 @@ def _pct(curr: float, base: float) -> float | None:
     return (curr - base) / base * 100.0
 
 
+def credits_visible(usage: float, invoiced: float, decimals: int = 0) -> bool:
+    """True when the two bases differ once rounded to the precision on screen.
+
+    Without the rounding, a fraction-of-a-rupee artifact would add a column that
+    shows two identical numbers.
+    """
+    return round(usage, decimals) != round(invoiced, decimals)
+
+
 def _series(df, day, col):
     """Cost for one service on one day, tolerating absent days and columns."""
     if day not in df.index or col not in df.columns:
@@ -44,8 +53,15 @@ def _series(df, day, col):
     return float(df.at[day, col])
 
 
-def _build_section(cfg, label, cloud, currency, df, target):
-    """Turn one scope's DataFrame into a report section: 7 daily columns per service."""
+def _build_section(cfg, label, cloud, currency, frames, target):
+    """Turn one scope's frames into a report section: 7 daily columns per service.
+
+    `frames` is {"usage": df, "invoiced": df} — same index, same columns. Every
+    existing field stays on the usage basis; the invoiced basis only ever adds a
+    `*_invoiced` sibling, so ordering and percentages cannot change meaning.
+    """
+    df = frames["usage"]
+    inv = frames["invoiced"]
     days = [target - timedelta(days=WINDOW_DAYS - 1 - i) for i in range(WINDOW_DAYS)]
     prev = target - timedelta(days=1)
     last_week = target - timedelta(days=7)
@@ -69,6 +85,8 @@ def _build_section(cfg, label, cloud, currency, df, target):
             "week_total": sum(by_day),
             "today": today_v,
             "today_report": today_v * to_report,
+            "today_invoiced": _series(inv, target, svc),
+            "today_invoiced_report": _series(inv, target, svc) * to_report,
             "yesterday": prev_v,
             "yesterday_report": prev_v * to_report,
             "last_week": lw_v,
@@ -83,6 +101,7 @@ def _build_section(cfg, label, cloud, currency, df, target):
 
     daily_totals = [sum(_series(df, d, s) for s in services) for d in days]
     total_native = sum(_series(df, target, s) for s in services)
+    total_invoiced = sum(_series(inv, target, s) for s in services)
     prev_total = sum(_series(df, prev, s) for s in services)
     lw_total = sum(_series(df, last_week, s) for s in services)
 
@@ -96,6 +115,9 @@ def _build_section(cfg, label, cloud, currency, df, target):
         "week_total_native": sum(daily_totals),
         "total_native": total_native,
         "total_report": total_native * to_report,
+        "total_invoiced_native": total_invoiced,
+        "total_invoiced_report": total_invoiced * to_report,
+        "credits_report": (total_native - total_invoiced) * to_report,
         "prev_total_native": prev_total,
         "prev_total_report": prev_total * to_report,
         "lw_total_native": lw_total,
@@ -115,12 +137,12 @@ def _aws_sections(cfg, target):
         log.error("AWS fetch failed: %s", e)
         return []
     out = []
-    for label, df in scoped.items():
-        if target not in df.index:
+    for label, fr in scoped.items():
+        if target not in fr["usage"].index:
             log.warning("AWS %s: target %s missing (have %s..%s) — skipping",
-                        label, target, df.index.min(), df.index.max())
+                        label, target, fr["usage"].index.min(), fr["usage"].index.max())
             continue
-        out.append(_build_section(cfg, label, "AWS", "USD", df, target))
+        out.append(_build_section(cfg, label, "AWS", "USD", fr, target))
     return out
 
 
@@ -135,37 +157,44 @@ def _gcp_sections(cfg, target, source, cloud, label_prefix):
         return []
     ccy = cfg.get("currency") or "INR"
     out = []
-    for project, df in scoped.items():
-        if target not in df.index:
+    for project, fr in scoped.items():
+        if target not in fr["usage"].index:
             log.warning("GCP %s: target %s missing (have %s..%s) — skipping",
-                        project, target, df.index.min(), df.index.max())
+                        project, target, fr["usage"].index.min(), fr["usage"].index.max())
             continue
-        out.append(_build_section(cfg, f"{label_prefix}{project}", cloud, ccy, df, target))
+        out.append(_build_section(cfg, f"{label_prefix}{project}", cloud, ccy, fr, target))
     return out
 
 
 def _vendor_section(cfg, target):
-    """The third-party vendor as a report section: one account, one row per module
-    across the 7-day window.
+    """The third-party vendor as a report section: one account, one row per
+    billing unit across the 7-day window.
 
     The vendor API is single-day, so the window is assembled with one call per day
-    (target-7 .. target — the WoW baseline needs day-7). Any failure (an expired
-    session token being the usual one) drops the vendor from the live report rather
-    than failing the run — the ClickHouse store is the durable record, this is
-    best-effort presentation.
+    (target-7 .. target — the WoW baseline needs day-7). Each day is fetched and
+    priced independently (store.vendor_priced_day) — an unavailable day (the
+    vendor's log export has real gaps) is skipped and logged, not treated as a
+    reason to drop the whole section: the other 7 days are still worth showing.
+    Only a missing TARGET day (nothing to report for the day this report is
+    actually about) empties the section.
     """
+    import store
     import vendor_billing
     if not vendor_billing.configured(cfg):
         return []
     label = cfg.get("vendor_account_label") or "Vendor"
     window = [target - timedelta(days=i) for i in range(WINDOW_DAYS)] + [target - timedelta(days=7)]
     per_day = {}
-    try:
-        for d in sorted(set(window)):
-            per_day[d] = {r["service"]: r["cost"] for r in vendor_billing.fetch_day(cfg, d)}
-    except Exception as e:
-        log.error("Vendor billing fetch failed — omitting from the live report: %s", e)
-        return []
+    unavailable = []
+    for d in sorted(set(window)):
+        hits = store.vendor_priced_day(cfg, d)
+        if hits is None:
+            unavailable.append(d)
+            continue
+        per_day[d] = {r["service"]: r["cost"] for r in hits}
+    if unavailable:
+        log.warning("Vendor log unavailable for %d day(s) in the report window: %s",
+                    len(unavailable), ", ".join(d.isoformat() for d in unavailable))
     if not per_day.get(target):
         return []
 
@@ -174,7 +203,9 @@ def _vendor_section(cfg, target):
                    for d in sorted(per_day)]
     df = pd.DataFrame(rows_by_day, index=sorted(per_day))
     df["Total"] = df.sum(axis=1)
-    return [_build_section(cfg, label, "VENDOR", cfg["report_currency"], df, target)]
+    # The vendor bill carries no credits, so both bases are the same frame.
+    return [_build_section(cfg, label, "VENDOR", cfg["report_currency"],
+                           {"usage": df, "invoiced": df}, target)]
 
 
 def collect(cfg: dict, target: date | None = None) -> dict:
@@ -245,14 +276,18 @@ def monthly_projection(cfg: dict, report: dict) -> list[dict]:
     days = int(cfg.get("projection_days") or 30)
     t = report["totals"]
 
+    vendor_label = cfg.get("vendor_cost_head") or "Vendor"
+
     rows = []
     for cloud, daily in sorted(t["by_cloud"].items(), key=lambda kv: kv[1], reverse=True):
         projected = daily * days
+        invoiced_daily = t["by_cloud_invoiced"].get(cloud, 0.0)
         budget = budgets.get(cloud)
         rows.append({
-            "label": cloud_name(cloud),
+            "label": vendor_label if cloud == "VENDOR" else cloud_name(cloud),
             "daily": daily,
             "projected": projected,
+            "projected_invoiced": invoiced_daily * days,
             "budget": budget,
             "pct": ((projected - budget) / budget * 100.0) if budget else None,
             "diff": (projected - budget) if budget else None,
@@ -264,6 +299,7 @@ def monthly_projection(cfg: dict, report: dict) -> list[dict]:
         "label": "Total",
         "daily": total_daily,
         "projected": total_daily * days,
+        "projected_invoiced": t["grand_total_invoiced"] * days,
         "budget": total_budget,
         "pct": ((total_daily * days - total_budget) / total_budget * 100.0)
                if total_budget else None,
@@ -300,22 +336,29 @@ def unit_economics(cfg: dict, report: dict) -> list[dict]:
 
     cloud = sum(v for c, v in t["by_cloud"].items() if c not in ("GMP", "VENDOR"))
     maps = t["by_cloud"].get("GMP", 0.0)
+    cloud_invoiced = sum(v for c, v in t["by_cloud_invoiced"].items()
+                         if c not in ("GMP", "VENDOR"))
+    maps_invoiced = t["by_cloud_invoiced"].get("GMP", 0.0)
 
     rows = []
 
-    def add(label, cost, n):
+    def add(label, cost, n, cost_invoiced=None):
         if n and cost:
-            rows.append({"label": label, "cost": cost, "rides": n, "per_ride": cost / n})
+            rows.append({"label": label, "cost": cost, "rides": n, "per_ride": cost / n,
+                         "cost_invoiced": cost_invoiced,
+                         "per_ride_invoiced": (cost_invoiced / n)
+                                              if cost_invoiced is not None else None})
 
-    add("Total Cloud Cost", cloud, rides_only)
+    add("Total Cloud Cost", cloud, rides_only, cloud_invoiced)
     if both:
-        add(f"Total Cloud Cost ({incl})", cloud, total_rides)
-    add("Total Maps Cost", maps, rides_only)
+        add(f"Total Cloud Cost ({incl})", cloud, total_rides, cloud_invoiced)
+    add("Total Maps Cost", maps, rides_only, maps_invoiced)
     if both:
-        add(f"Total Maps Cost ({incl})", maps, total_rides)
-    add("Total Cloud + Maps Cost", cloud + maps, rides_only)
+        add(f"Total Maps Cost ({incl})", maps, total_rides, maps_invoiced)
+    add("Total Cloud + Maps Cost", cloud + maps, rides_only, cloud_invoiced + maps_invoiced)
     if both:
-        add(f"Total Cloud + Maps Cost ({incl})", cloud + maps, total_rides)
+        add(f"Total Cloud + Maps Cost ({incl})", cloud + maps, total_rides,
+            cloud_invoiced + maps_invoiced)
     return rows
 
 
@@ -328,9 +371,12 @@ def _totals(cfg, sections):
     """
     by_cloud: dict[str, float] = {}
     by_cloud_lw: dict[str, float] = {}
+    by_cloud_invoiced: dict[str, float] = {}
     for s in sections:
         by_cloud[s["cloud"]] = by_cloud.get(s["cloud"], 0.0) + s["total_report"]
         by_cloud_lw[s["cloud"]] = by_cloud_lw.get(s["cloud"], 0.0) + s["lw_total_report"]
+        by_cloud_invoiced[s["cloud"]] = (by_cloud_invoiced.get(s["cloud"], 0.0)
+                                         + s["total_invoiced_report"])
 
 
     grand = sum(by_cloud.values())
@@ -340,6 +386,7 @@ def _totals(cfg, sections):
             "label": f"Total {cloud} Costs",
             "cloud": cloud,
             "total": total,
+            "total_invoiced": by_cloud_invoiced.get(cloud, 0.0),
             "lw_total": by_cloud_lw.get(cloud, 0.0),
             "wow_pct": _pct(total, by_cloud_lw.get(cloud, 0.0)),
         })
@@ -347,7 +394,10 @@ def _totals(cfg, sections):
     return {
         "buckets": buckets,
         "by_cloud": by_cloud,
+        "by_cloud_invoiced": by_cloud_invoiced,
         "grand_total": grand,
+        "grand_total_invoiced": sum(by_cloud_invoiced.values()),
+        "credits": grand - sum(by_cloud_invoiced.values()),
         "grand_total_lw": sum(by_cloud_lw.values()),
         "grand_wow_pct": _pct(grand, sum(by_cloud_lw.values())),
     }

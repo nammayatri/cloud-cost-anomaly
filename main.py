@@ -5,6 +5,7 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
+import budgets as budget_store
 import collect as collector
 import config as config_loader
 import money
@@ -21,6 +22,13 @@ def run(dry_run: bool = False, target: date | None = None, provider_name: str | 
         out_path: str | None = None, no_post: bool = False) -> int:
     cfg = config_loader.load(provider=provider_name)
     target = target or collector.default_target()
+
+    # Budgets come from the shared table when it is reachable, so the Slack
+    # report and the Control Center dashboard cannot disagree. Anything missing
+    # leaves the configured MONTHLY_BUDGETS in place.
+    live_budgets = budget_store.fetch(cfg, target)
+    if live_budgets:
+        cfg["monthly_budgets"] = live_budgets
 
     report = collector.collect(cfg, target)
 
@@ -69,10 +77,19 @@ def _print_summary(cfg: dict, report: dict, path: str) -> None:
     t = report["totals"]
     print(f"\nReport for {report['date']}  (workbook: {path})")
     print("-" * 72)
+    dec = 0 if cfg["report_currency"] == "INR" else 2
+    show_inv = any(collector.credits_visible(s["total_report"], s["total_invoiced_report"], dec)
+                   for s in report["sections"])
     for b in t["buckets"]:
         share = (b["total"] / t["grand_total"] * 100.0) if t["grand_total"] else 0.0
-        print(f"  {b['label']:<28} {money.fmt(cfg, b['total']):>16}  ({share:5.2f}%)")
-    print(f"  {'Total Cloud Costs':<28} {money.fmt(cfg, t['grand_total']):>16}")
+        line = f"  {b['label']:<28} {money.fmt(cfg, b['total']):>16}  ({share:5.2f}%)"
+        if show_inv:
+            line += f"   invoiced {money.fmt(cfg, b['total_invoiced'])}"
+        print(line)
+    total_line = f"  {'Total Cloud Costs':<28} {money.fmt(cfg, t['grand_total']):>16}"
+    if show_inv:
+        total_line += f"   invoiced {money.fmt(cfg, t['grand_total_invoiced'])}"
+    print(total_line)
     rides = report.get("rides")
     if rides and rides.get("total"):
         print(f"  {'Total Rides':<28} {rides['total']:>16,}")

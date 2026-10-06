@@ -10,9 +10,12 @@ scopes(cfg) -> list[str]
     for: the whole account on AWS, one project on GCP. Order is preserved in the
     Slack output, so the first scope is the one that appears at the top.
 
-fetch_by_service(cfg, end) -> dict[scope, DataFrame]
-    Per scope: a DataFrame indexed by date, one column per service, plus 'Total'.
-    Covers the trailing cfg['lookback_days'], ending at `end` (exclusive).
+fetch_by_service(cfg, end) -> dict[scope, dict[basis, DataFrame]]
+    Per scope, one frame per basis: "usage" (after commitment and negotiated
+    discounts, before promotional credits) and "invoiced" (after every credit).
+    Both frames are indexed by date with one column per service plus 'Total', and
+    both cover the trailing cfg['lookback_days'] ending at `end` (exclusive).
+    The two bases differ only where credits exist; with none, they are identical.
 
 currency(cfg) -> str
     ISO code the provider reports in. Drives money formatting in slack.py.

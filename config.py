@@ -81,6 +81,10 @@ _DEFAULTS = {
 
     "slack_bot_token": None,
     "slack_channel_id": None,
+    # Kill switch: the token/channel stay required (other things may depend on
+    # them being configured), but setting this false skips the actual post —
+    # everything else (ClickHouse write, Xyne) still runs normally.
+    "slack_enabled": True,
 
     # --- Xyne (Slack-compatible adapter) ---
     # Optional second destination. All three must be set or Xyne is skipped.
@@ -91,6 +95,13 @@ _DEFAULTS = {
     # Literal mention string prepended nowhere — appended to the Xyne root message.
     # Xyne has its own directory, so Slack user/group IDs do not carry over.
     "xyne_mention": None,
+    # Weekly instead of daily: Xyne only posts when the cron runs on a Monday
+    # (Slack is unaffected). Xyne's channel is lower-traffic than Slack's and
+    # wants a digest cadence, not a daily one.
+    "xyne_weekly_only": True,
+    # Optional link appended to the end of the Xyne root message, e.g. the
+    # Control Center dashboard. Omit to append nothing.
+    "control_center_dashboard": None,
 
     # --- Cost store (ClickHouse cost_analytics.cost_daily) ---
     # Optional. When set, each run persists the day's per-service cost for the
@@ -104,14 +115,20 @@ _DEFAULTS = {
     "cost_ch_secure": False,
 
     # --- Third-party vendor daily cost (optional) ---
-    # A billing source with no machine credential: authenticated by a session
-    # token pasted into the secret and refreshed periodically. Everything vendor-
-    # specific (endpoint, token, labels) is supplied here, never hardcoded.
-    "vendor_api_url": None,
-    "vendor_origin": None,               # request Origin header, if the API needs it
-    "vendor_client_id": None,
-    "vendor_refresh_token": None,        # session token; refresh in the secret as needed
-    "vendor_current_credentials": None,
+    # Cost is computed here, not fetched pre-computed: a machine-credentialed logs
+    # API returns one row per request made that day (endpoint + status), and each
+    # is priced by `vendor_pricing`. Everything vendor-specific (endpoint,
+    # credentials, prices) is supplied here, never hardcoded.
+    "vendor_logs_api_url": None,         # POST {"date": "YYYY-MM-DD"} -> presigned CSV url
+    "vendor_app_id": None,               # "appid" request header
+    "vendor_app_key": None,              # "appKey" request header — secret
+    # Monthly-cumulative slab pricing, keyed by BILLING UNIT (not endpoint — one
+    # endpoint can bill under more than one unit, see vendor_billing._ENDPOINT_UNITS),
+    # in report_currency. Each value is a list of [lo, hi_or_null, price] tiers,
+    # 1-indexed inclusive request ranges for the month (hi=null = open-ended top
+    # tier). A unit with no entry here still shows up in the report at zero cost
+    # — see vendor_billing.py.
+    "vendor_pricing": {},
     "vendor_account_label": "Vendor",    # account-column label
     "vendor_type": "Data and Tools",     # `type` grouping for these rows
     "vendor_cost_head": "Vendor",
@@ -132,9 +149,9 @@ _CAST = {
 _LIST_KEYS = ("gcp_projects", "gmp_projects")
 
 # Env vars that carry structured data, as a JSON string.
-_JSON_KEYS = ("aws_accounts", "monthly_budgets")
+_JSON_KEYS = ("aws_accounts", "monthly_budgets", "vendor_pricing")
 
-_BOOL_KEYS = ("clickhouse_secure", "fx_fetch", "cost_ch_secure")
+_BOOL_KEYS = ("clickhouse_secure", "fx_fetch", "cost_ch_secure", "xyne_weekly_only", "slack_enabled")
 
 _TRUTHY = {"1", "true", "yes", "on"}
 

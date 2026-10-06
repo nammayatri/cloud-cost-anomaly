@@ -11,6 +11,10 @@ therefore cannot drift: a change to a table shows up in both, or in neither.
 Threading works: `thread_ts` nests the reply correctly, even though the response
 object does not echo the field back. The reply structure therefore mirrors Slack's
 exactly — one root, everything else in the thread.
+
+Cadence differs from Slack's on purpose: Xyne's channel wants a weekly digest,
+not a daily post, so `xyne_weekly_only` (default on) skips every run except the
+one that lands on a Monday. Slack posts every day regardless.
 """
 
 import json
@@ -18,6 +22,7 @@ import logging
 import mimetypes
 import urllib.request
 import uuid
+from datetime import date
 from pathlib import Path
 
 import slack
@@ -167,6 +172,14 @@ def post(cfg: dict, report: dict, xlsx_path: str) -> None:
         log.info("Xyne not configured — skipping")
         return
 
+    # Xyne's channel wants a weekly digest, not a daily post — Slack stays daily.
+    # Gated on the day the cron actually RUNS (today), not the report's T-2
+    # target day: "no Xyne messages except on Mondays" is about how often a
+    # message goes out, not which day it's reporting on.
+    if cfg.get("xyne_weekly_only", True) and date.today().weekday() != 0:  # Monday
+        log.info("Xyne: weekly-only, today isn't Monday — skipping")
+        return
+
     import tempfile
     tmp = tempfile.mkdtemp(prefix="cost-xyne-")
     images = slack.render_images(cfg, report, tmp)          # summary first
@@ -179,6 +192,9 @@ def post(cfg: dict, report: dict, xlsx_path: str) -> None:
     # mention is a separate literal string, carried on the summary card's comment.
     xm = (cfg.get("xyne_mention") or "").strip()
     comment = f"*Cloud costs — {d.isoformat()}*" + (f"\n{xm}" if xm else "")
+    dash = (cfg.get("control_center_dashboard") or "").strip()
+    if dash:
+        comment += f"\n<{dash}|Dashboard>"
     _, summary_png = images[0]
 
     # Root = the summary card itself (image + headline comment). Xyne returns the

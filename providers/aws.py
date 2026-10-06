@@ -11,6 +11,11 @@ which is the same shape the GCP provider already uses for projects.
 
 Every account's costs come back in USD regardless of where it sits; converting to
 the reporting currency is the caller's job (see money.to_report_currency).
+
+Both cost bases are fetched in the same call: UnblendedCost is the usage basis (it
+already reflects RI/Savings Plan discounts but no credits), NetUnblendedCost is
+what is actually invoiced. Asking for both metrics at once costs nothing extra —
+Cost Explorer bills per request, not per metric.
 """
 
 import logging
@@ -103,12 +108,23 @@ def _paginate(ce, **kwargs):
     return pages
 
 
-def fetch_by_service(cfg: dict, end: date | None = None) -> dict[str, pd.DataFrame]:
-    """Daily UnblendedCost grouped by SERVICE, per account, for the trailing lookback_days."""
+def _pivot(df, value_col: str):
+    """Long rows -> date-indexed frame, one column per service, plus 'Total'."""
+    pivot = df.pivot_table(index="date", columns="service", values=value_col,
+                           aggfunc="sum").fillna(0.0)
+    pivot.index = pd.to_datetime(pivot.index).date
+    pivot = pivot.sort_index()
+    pivot["Total"] = pivot.sum(axis=1)
+    return pivot
+
+
+def fetch_by_service(cfg: dict, end: date | None = None) -> dict[str, dict]:
+    """Daily cost grouped by SERVICE, per account, on both bases (UnblendedCost =
+    usage, NetUnblendedCost = invoiced), for the trailing lookback_days."""
     end = end or date.today()
     start = end - timedelta(days=cfg["lookback_days"])
 
-    out: dict[str, pd.DataFrame] = {}
+    out: dict[str, dict] = {}
     for acct in _accounts(cfg):
         # One unreachable account must not take the others down with it. A missing
         # cross-account role or an expired credential is a per-account problem;
@@ -119,7 +135,7 @@ def fetch_by_service(cfg: dict, end: date | None = None) -> dict[str, pd.DataFra
                 _client(cfg, acct),
                 TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
                 Granularity="DAILY",
-                Metrics=["UnblendedCost"],
+                Metrics=["UnblendedCost", "NetUnblendedCost"],
                 GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
             )
         except Exception as e:
@@ -132,17 +148,18 @@ def fetch_by_service(cfg: dict, end: date | None = None) -> dict[str, pd.DataFra
                 d = day["TimePeriod"]["Start"]
                 for grp in day["Groups"]:
                     svc = grp["Keys"][0]
-                    amt = float(grp["Metrics"]["UnblendedCost"]["Amount"])
-                    rows.append((d, svc, amt))
+                    m = grp["Metrics"]
+                    rows.append((d, svc,
+                                 float(m["UnblendedCost"]["Amount"]),
+                                 float(m["NetUnblendedCost"]["Amount"])))
 
         if not rows:
             continue
 
-        df = pd.DataFrame(rows, columns=["date", "service", "cost"])
-        pivot = df.pivot_table(index="date", columns="service", values="cost", aggfunc="sum").fillna(0.0)
-        pivot.index = pd.to_datetime(pivot.index).date
-        pivot = pivot.sort_index()
-        pivot["Total"] = pivot.sum(axis=1)
-        out[acct["label"]] = pivot
+        df = pd.DataFrame(rows, columns=["date", "service", "cost", "cost_invoiced"])
+        out[acct["label"]] = {
+            "usage": _pivot(df, "cost"),
+            "invoiced": _pivot(df, "cost_invoiced"),
+        }
 
     return out
