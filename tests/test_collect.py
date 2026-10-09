@@ -1,6 +1,9 @@
 import datetime as dt
+from unittest import mock
 
 import collect
+import exotel_billing
+import store
 from tests.factories import frames
 
 CFG = {"report_currency": "INR", "currency": "INR", "usd_inr_rate": 96.0}
@@ -43,3 +46,30 @@ def test_credits_visible_respects_display_rounding():
     assert collect.credits_visible(100.0, 100.0, 0) is False
     assert collect.credits_visible(100.006, 100.0, 0) is False   # rounds away in INR
     assert collect.credits_visible(100.006, 100.0, 2) is True    # survives 2dp
+
+
+def test_exotel_section_only_live_fetches_the_target_day():
+    # Exotel's real call volume makes a live fetch take ~10 minutes even
+    # parallelized — only the target day may ever hit the live API; the rest
+    # of the WoW window must come from ClickHouse instead (store.exotel_stored_day).
+    cfg = {**CFG, "exotel_account_sid": "x", "exotel_api_key": "k", "exotel_api_token": "t",
+           "exotel_account_label": "Exotel"}
+    live_days, stored_days = [], []
+
+    def fake_live(cfg, d):
+        live_days.append(d)
+        return [{"account": "Exotel", "service": "inbound", "cost": 100.0, "units": 10.0}]
+
+    def fake_stored(cfg, d):
+        stored_days.append(d)
+        return [{"account": "Exotel", "service": "inbound", "cost": 50.0, "units": 5.0}]
+
+    with mock.patch.object(store, "exotel_priced_day", side_effect=fake_live), \
+         mock.patch.object(store, "exotel_stored_day", side_effect=fake_stored), \
+         mock.patch.object(exotel_billing, "configured", return_value=True):
+        sections = collect._exotel_section(cfg, TARGET)
+
+    assert live_days == [TARGET]
+    assert TARGET not in stored_days
+    assert len(stored_days) == collect.WINDOW_DAYS   # the other days in the window
+    assert sections and sections[0]["cloud"] == "EXOTEL"

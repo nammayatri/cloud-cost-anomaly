@@ -177,21 +177,22 @@ def build_root_blocks(cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
         "text": {"type": "plain_text", "text": f"Cloud Costs On {d.isoformat()}", "emoji": True},
     }]
 
-    # "Cloud" = the infrastructure clouds (AWS + GCP). Maps and the third-party
-    # vendor are their own named buckets, each shown as a single total line, and
-    # all three roll into the grand total. The vendor's display name is config.
-    _NAMED = {"GMP", "VENDOR"}
-    vendor_label = cfg.get("vendor_cost_head") or "Vendor"
+    # "Cloud" = the infrastructure clouds (AWS + GCP). Maps and the named
+    # vendors are their own buckets, each shown as a single total line, and all
+    # of them roll into the grand total. Each vendor's display name is config.
+    _NAMED = {"GMP", "VENDOR", "EXOTEL"}
+    named_labels = {"VENDOR": cfg.get("vendor_cost_head") or "Vendor",
+                    "EXOTEL": cfg.get("exotel_cost_head") or "Exotel"}
     cloud_total = sum(v for c, v in t["by_cloud"].items() if c not in _NAMED)
     maps_total = t["by_cloud"].get("GMP", 0.0)
-    vendor_total = t["by_cloud"].get("VENDOR", 0.0)
+    named_totals = {c: t["by_cloud"].get(c, 0.0) for c in ("VENDOR", "EXOTEL")}
     cloud_budget = sum(v for c, v in budgets.items() if c not in _NAMED and v)
 
     show_inv = _any_credits(cfg, report["sections"])
     inv_by_cloud = t["by_cloud_invoiced"]
     cloud_inv = sum(v for c, v in inv_by_cloud.items() if c not in _NAMED)
     maps_inv = inv_by_cloud.get("GMP", 0.0)
-    vendor_inv = inv_by_cloud.get("VENDOR", 0.0)
+    named_inv = {c: inv_by_cloud.get(c, 0.0) for c in ("VENDOR", "EXOTEL")}
 
     entries = []
     for cloud in _cloud_order(report):
@@ -201,13 +202,16 @@ def build_root_blocks(cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
                         budgets.get(cloud), inv_by_cloud.get(cloud, 0.0)))
     if maps_total:
         entries.append(("Maps Total", maps_total, (budgets.get("GMP") or None), maps_inv))
-    if vendor_total:
-        entries.append((f"{vendor_label} Total", vendor_total,
-                        (budgets.get("VENDOR") or None), vendor_inv))
-    grand = cloud_total + maps_total + vendor_total
+    for c in ("VENDOR", "EXOTEL"):
+        if named_totals[c]:
+            entries.append((f"{named_labels[c]} Total", named_totals[c],
+                            (budgets.get(c) or None), named_inv[c]))
+    named_total = sum(named_totals.values())
+    named_budget = sum(budgets.get(c) or 0 for c in ("VENDOR", "EXOTEL"))
+    grand = cloud_total + maps_total + named_total
     entries.append(("Total", grand,
-                    (cloud_budget + (budgets.get("GMP") or 0) + (budgets.get("VENDOR") or 0)) or None,
-                    cloud_inv + maps_inv + vendor_inv))
+                    (cloud_budget + (budgets.get("GMP") or 0) + named_budget) or None,
+                    cloud_inv + maps_inv + sum(named_inv.values())))
 
     # The goal is shown as a DAILY figure (monthly budget / projection days) so it
     # sits in the same units as the cost beside it. Comparing a day's spend to a
@@ -606,7 +610,7 @@ def _image_specs(cfg: dict, report: dict) -> list[tuple[str, list[dict]]]:
     summary = top_blocks + [b for b in attachments[0]["blocks"]
                             if b.get("text", {}).get("text") != mention]
 
-    infra = {s["cloud"] for s in report["sections"] if s["cloud"] not in ("GMP", "VENDOR")}
+    infra = {s["cloud"] for s in report["sections"] if s["cloud"] not in ("GMP", "VENDOR", "EXOTEL")}
     specs: list[tuple[str, list[dict]]] = [
         ("summary", summary),
         ("cloud-account-split",
@@ -615,14 +619,17 @@ def _image_specs(cfg: dict, report: dict) -> list[tuple[str, list[dict]]]:
     vend = next((sec for sec in report["sections"] if sec["cloud"] == "VENDOR"), None)
     if vend:
         specs.append(("vendor-by-module", _section_table_blocks(cfg, report, vend)))
+    exo = next((sec for sec in report["sections"] if sec["cloud"] == "EXOTEL"), None)
+    if exo:
+        specs.append(("exotel-by-direction", _section_table_blocks(cfg, report, exo)))
     specs.append(("maps",
                   _account_split_blocks(cfg, report, {"GMP"}, "*Maps — account split*")
                   + _gmp_table_blocks(cfg, report)))
     specs.append(("monthly-run-rate", _runrate_blocks(cfg, report)))
     specs.append(("cost-per-ride", _per_ride_blocks(cfg, report)))
     for section in sorted(report["sections"], key=lambda x: x["total_report"], reverse=True):
-        if section["cloud"] in ("GMP", "VENDOR"):
-            continue          # GMP via the per-API table, vendor via the by-module reply
+        if section["cloud"] in ("GMP", "VENDOR", "EXOTEL"):
+            continue          # GMP via the per-API table, vendors via their own by-module replies
         specs.append((_account(section["label"]),
                       _section_table_blocks(cfg, report, section)))
     specs.append(("biggest-increases", _movers_blocks(cfg, report, rising=True)))

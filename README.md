@@ -111,6 +111,15 @@ All settings come from **either** environment variables **or** `config.json`. En
 | `vendor_logs_api_url` | `VENDOR_LOGS_API_URL` | — | Third-party verification vendor's daily request-logs endpoint. Omit to skip the vendor entirely |
 | `vendor_app_id` / `vendor_app_key` | `VENDOR_APP_ID` / `VENDOR_APP_KEY` | — | Vendor API credentials (`appid` / `appKey` headers). Key is a secret |
 | `vendor_pricing` | `VENDOR_PRICING` | `{}` | JSON, keyed by billing UNIT (not endpoint — see `vendor_billing._ENDPOINT_UNITS`); each value a list of `[lo, hi_or_null, price]` monthly-cumulative slab tiers, in `report_currency` |
+| `exotel_api_url` | `EXOTEL_API_URL` | — | Exotel API base URL, e.g. `https://api.exotel.com`. Omit to skip Exotel entirely |
+| `exotel_account_sid` | `EXOTEL_ACCOUNT_SID` | — | Exotel account SID |
+| `exotel_api_key` / `exotel_api_token` | `EXOTEL_API_KEY` / `EXOTEL_API_TOKEN` | — | Exotel API credentials (HTTP Basic). Both are secrets |
+| `exotel_page_size` | `EXOTEL_PAGE_SIZE` | `100` | Calls per page; the API hard-caps this at 100 |
+| `exotel_window_minutes` | `EXOTEL_WINDOW_MINUTES` | `60` | A day is split into windows this wide, fetched concurrently |
+| `exotel_max_pages_per_window` | `EXOTEL_MAX_PAGES_PER_WINDOW` | `3000` | Safety cap against runaway pagination |
+| `exotel_max_workers` | `EXOTEL_MAX_WORKERS` | `2` | Concurrent windows in flight — raise cautiously, see `exotel_billing.py` |
+| `exotel_retry_attempts` / `exotel_retry_base_delay` | `EXOTEL_RETRY_ATTEMPTS` / `EXOTEL_RETRY_BASE_DELAY` | `6` / `5` | Retries on HTTP 429, backoff doubles each attempt |
+| `exotel_timeout` | `EXOTEL_TIMEOUT` | `45` | Seconds, per HTTP request |
 
 ### Budgets
 

@@ -163,6 +163,33 @@ spec:
                       "central_db_check": [[0, 200000, 0], [200001, 500000, 0], [500001, null, 0]],
                       "async_checkDL": [[0, 200000, 0], [200001, 500000, 0], [500001, null, 0]]
                     }
+                # --- Exotel (voice calls, optional) ---
+                # No pricing table needed — Exotel reports the price of every
+                # call directly, see exotel_billing.py. EXOTEL_API_KEY and
+                # EXOTEL_API_TOKEN are the secret half, from cost-report-secret.
+                - name: EXOTEL_API_URL
+                  value: "https://api.exotel.com"
+                - name: EXOTEL_ACCOUNT_SID
+                  value: "<EXOTEL_ACCOUNT_SID>"
+                # Fetch tuning — hand-picked against a real account (see
+                # exotel_billing.py), not guessed. EXOTEL_MAX_WORKERS in
+                # particular: raise cautiously, a live account hit a 429 at
+                # higher concurrency with no Retry-After to size a safe value
+                # from.
+                - name: EXOTEL_PAGE_SIZE
+                  value: "100"
+                - name: EXOTEL_WINDOW_MINUTES
+                  value: "60"
+                - name: EXOTEL_MAX_PAGES_PER_WINDOW
+                  value: "3000"
+                - name: EXOTEL_MAX_WORKERS
+                  value: "2"
+                - name: EXOTEL_RETRY_ATTEMPTS
+                  value: "6"
+                - name: EXOTEL_RETRY_BASE_DELAY
+                  value: "5"
+                - name: EXOTEL_TIMEOUT
+                  value: "45"
               envFrom:
                 - secretRef:
                     name: cost-report-secret

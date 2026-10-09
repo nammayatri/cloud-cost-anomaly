@@ -133,6 +133,24 @@ _DEFAULTS = {
     "vendor_type": "Data and Tools",     # `type` grouping for these rows
     "vendor_cost_head": "Vendor",
 
+    "exotel_api_url": None,               # e.g. https://api.exotel.com — never hardcoded, see exotel_billing.py
+    "exotel_account_sid": None,
+    "exotel_api_key": None,
+    "exotel_api_token": None,            # secret
+    "exotel_account_label": "Exotel",
+    "exotel_type": "Data and Tools",
+    "exotel_cost_head": "Exotel",
+    # Fetch tuning — every number here was hand-picked against a real account
+    # (see exotel_billing.py), not guessed, but the right values depend on that
+    # account's actual volume and rate limit, so they're config, not code.
+    "exotel_page_size": 100,              # server-enforced max; raising this is rejected with 400
+    "exotel_window_minutes": 60,          # a day is split into windows this wide, fetched concurrently
+    "exotel_max_pages_per_window": 3000,  # safety cap against runaway pagination
+    "exotel_max_workers": 2,              # concurrent windows in flight — raise cautiously, see exotel_billing.py
+    "exotel_retry_attempts": 6,           # retries on HTTP 429 before giving up
+    "exotel_retry_base_delay": 5,         # seconds; doubles each retry (5, 10, 20, ...)
+    "exotel_timeout": 45,                 # seconds, per HTTP request
+
     "lookback_days": 21,
     "mention": "",
 }
@@ -143,6 +161,13 @@ _CAST = {
     "clickhouse_port": int,
     "cost_ch_port": int,
     "projection_days": int,
+    "exotel_page_size": int,
+    "exotel_window_minutes": int,
+    "exotel_max_pages_per_window": int,
+    "exotel_max_workers": int,
+    "exotel_retry_attempts": int,
+    "exotel_retry_base_delay": int,
+    "exotel_timeout": int,
 }
 
 # Env vars that carry a list, as comma-separated values.

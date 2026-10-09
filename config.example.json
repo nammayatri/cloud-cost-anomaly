@@ -70,5 +70,19 @@
   },
   "vendor_account_label": "Vendor",
   "vendor_type": "Data and Tools",
-  "vendor_cost_head": "Vendor"
+  "vendor_cost_head": "Vendor",
+  "exotel_api_url": "https://api.exotel.com",
+  "exotel_account_sid": "<exotel-account-sid>",
+  "exotel_api_key": "<exotel-api-key>",
+  "exotel_api_token": "<exotel-api-token>",
+  "exotel_account_label": "Exotel",
+  "exotel_type": "Data and Tools",
+  "exotel_cost_head": "Exotel",
+  "exotel_page_size": 100,
+  "exotel_window_minutes": 60,
+  "exotel_max_pages_per_window": 3000,
+  "exotel_max_workers": 2,
+  "exotel_retry_attempts": 6,
+  "exotel_retry_base_delay": 5,
+  "exotel_timeout": 45
 }

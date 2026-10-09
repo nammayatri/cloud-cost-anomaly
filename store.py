@@ -27,6 +27,7 @@ import urllib.parse
 import urllib.request
 from datetime import date, timedelta
 
+import exotel_billing
 import money
 import providers
 import vendor_billing
@@ -178,6 +179,72 @@ def _vendor_rows(cfg: dict, day) -> list[dict]:
                  cfg["report_currency"], 1.0, units=h.get("units"), type_head=th) for h in hits]
 
 
+def exotel_priced_day(cfg: dict, day: date) -> list[dict] | None:
+    """Priced Exotel rows for one day: [{"account","service","cost","units"}].
+
+    No month-to-date baseline needed — Exotel prices each call itself, so
+    there's no slab to track. Same None-vs-[] contract as vendor_priced_day:
+    None means the fetch failed (unavailable), [] means a real zero-call day.
+    """
+    if not exotel_billing.configured(cfg):
+        return []
+    try:
+        return exotel_billing.fetch_day(cfg, day)
+    except Exception as e:
+        log.warning("Exotel call log for %s unavailable: %s", day, e)
+        return None
+
+
+def exotel_stored_day(cfg: dict, day: date) -> list[dict] | None:
+    if not configured(cfg):
+        return None
+    db = cfg.get("cost_ch_database", "cost_analytics")
+    tbl = cfg.get("cost_ch_table", "cost_daily")
+    query = (
+        f"SELECT service, sum(cost_native) AS cost, sum(units) AS units FROM {db}.{tbl} FINAL "
+        f"WHERE cost_head = {{cost_head:String}} AND type = {{vtype:String}} AND date = {{day:Date}} "
+        f"GROUP BY service FORMAT JSONEachRow"
+    )
+    qs = urllib.parse.urlencode({
+        "query": query,
+        "param_cost_head": cfg.get("exotel_cost_head", "Exotel"),
+        "param_vtype": cfg.get("exotel_type", "Data and Tools"),
+        "param_day": day.isoformat(),
+    })
+    scheme = "https" if cfg.get("cost_ch_secure") else "http"
+    url = f"{scheme}://{cfg['cost_ch_host']}:{cfg.get('cost_ch_port', 8123)}/?{qs}"
+    req = urllib.request.Request(url, headers={
+        "X-ClickHouse-User": cfg["cost_ch_user"],
+        "X-ClickHouse-Key": cfg["cost_ch_password"],
+    })
+    account = cfg.get("exotel_account_label") or "Exotel"
+    try:
+        resp = urllib.request.urlopen(req, timeout=_TIMEOUT)
+        rows = []
+        for line in resp.read().decode().splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            rows.append({"account": account, "service": r["service"],
+                        "cost": float(r["cost"]), "units": float(r["units"])})
+        return rows
+    except Exception as e:
+        log.warning("Exotel stored-day read for %s failed: %s", day, e)
+        return None
+
+
+def _exotel_rows(cfg: dict, day) -> list[dict]:
+    """Exotel per-direction rows for one day, if configured. Reporting
+    currency, fx 1.0. Never raises — an unavailable day must not fail the
+    whole write."""
+    hits = exotel_priced_day(cfg, day)
+    if not hits:
+        return []
+    th = (cfg.get("exotel_type", "Data and Tools"), cfg.get("exotel_cost_head", "Exotel"))
+    return [_row(day, "EXOTEL", h["account"], h["service"], h["cost"],
+                 cfg["report_currency"], 1.0, units=h.get("units"), type_head=th) for h in hits]
+
+
 _COLUMNS_CACHE: dict[str, set[str]] = {}
 
 
@@ -246,11 +313,12 @@ def _rows_from_report(cfg: dict, report: dict) -> list[dict]:
     day = report["date"]
     rows = []
     for s in report["sections"]:
-        # The vendor section is persisted separately by _vendor_rows — with its own
-        # cost_head/type and per-module usage units, freshly fetched. Letting it also
-        # flow through here would double-write the day: once under the configured
-        # vendor cost_head and again under the generic fallback ("Other"/"VENDOR").
-        if s["cloud"] == "VENDOR":
+        # The vendor/Exotel sections are persisted separately by _vendor_rows /
+        # _exotel_rows — with their own cost_head/type and per-unit usage,
+        # freshly fetched. Letting them also flow through here would double-write
+        # the day: once under the configured cost_head and again under the
+        # generic fallback ("Other"/"VENDOR" or "Other"/"EXOTEL").
+        if s["cloud"] in ("VENDOR", "EXOTEL"):
             continue
         fx = money.rate(cfg, s["currency"], cfg["report_currency"])
         for r in s["rows"]:
@@ -343,6 +411,34 @@ def _vendor_backfill_rows(cfg: dict, start: date, end: date) -> list[dict]:
     return rows
 
 
+def _exotel_backfill_rows(cfg: dict, start: date, end: date) -> list[dict]:
+    """Exotel rows for [start, end). No running total to seed or carry — each
+    day prices itself from the vendor's own `Price` field. A day whose call log
+    is unavailable is skipped, same as the live path."""
+    th = (cfg.get("exotel_type", "Data and Tools"), cfg.get("exotel_cost_head", "Exotel"))
+    rows: list[dict] = []
+    unavailable: list[date] = []
+
+    d = start
+    while d < end:
+        try:
+            hits = exotel_billing.fetch_day(cfg, d)
+        except Exception as e:
+            log.warning("Exotel call log for %s unavailable during backfill: %s", d, e)
+            unavailable.append(d)
+            d += timedelta(days=1)
+            continue
+        rows += [_row(d, "EXOTEL", h["account"], h["service"], h["cost"],
+                      cfg["report_currency"], 1.0, units=h.get("units"), type_head=th)
+                 for h in hits]
+        d += timedelta(days=1)
+
+    if unavailable:
+        log.warning("Exotel log unavailable for %d day(s) during backfill: %s",
+                    len(unavailable), ", ".join(x.isoformat() for x in unavailable))
+    return rows
+
+
 def backfill(cfg: dict, start: date, end: date) -> dict:
     """Populate cost_daily for [start, end) from each provider's own history.
 
@@ -401,6 +497,8 @@ def backfill(cfg: dict, start: date, end: date) -> dict:
 
     if vendor_billing.configured(cfg):
         counts["vendor"] = _insert(cfg, _vendor_backfill_rows(cfg, start, end))
+    if exotel_billing.configured(cfg):
+        counts["exotel"] = _insert(cfg, _exotel_backfill_rows(cfg, start, end))
 
     if want in ("aws", "all") and cfg.get("aws_accounts"):
         rows = emit(providers.get("aws").fetch_by_service(cfg, end=end), "AWS", "USD")
@@ -430,7 +528,8 @@ def write_report(cfg: dict, report: dict) -> None:
     if not configured(cfg):
         log.info("Cost store not configured — skipping ClickHouse write")
         return
-    rows = _rows_from_report(cfg, report) + _vendor_rows(cfg, report["date"])
+    rows = (_rows_from_report(cfg, report) + _vendor_rows(cfg, report["date"])
+            + _exotel_rows(cfg, report["date"]))
     try:
         n = _insert(cfg, rows)
         log.info("Wrote %d cost rows to ClickHouse for %s", n, report["date"])

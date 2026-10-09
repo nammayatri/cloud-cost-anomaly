@@ -62,14 +62,18 @@ def _rows(cfg: dict, month: date) -> list[dict]:
 
 def resolve(rows: list[dict], cfg: dict) -> dict[str, float]:
     """Budget rows -> the report's `monthly_budgets` shape, keyed by cloud."""
-    vendor = (cfg.get("vendor_type", "Data and Tools"), cfg.get("vendor_cost_head", "Vendor"))
+    named = {
+        "VENDOR": (cfg.get("vendor_type", "Data and Tools"), cfg.get("vendor_cost_head", "Vendor")),
+        "EXOTEL": (cfg.get("exotel_type", "Data and Tools"), cfg.get("exotel_cost_head", "Exotel")),
+    }
 
     head_level: dict[str, float] = {}
     account_level: dict[str, float] = {}
     for row in rows:
         cloud = store.cloud_for(row["type"], row["cost_head"])
-        if cloud is None and (row["type"], row["cost_head"]) == vendor:
-            cloud = "VENDOR"
+        if cloud is None:
+            cloud = next((c for c, pair in named.items()
+                         if pair == (row["type"], row["cost_head"])), None)
         if cloud is None:
             # A budget for a taxonomy this report doesn't publish. The dashboard
             # may still want it, so this is not an error — just not ours.

@@ -6,6 +6,7 @@ import store
 CFG = {
     "cost_ch_host": "h", "cost_ch_user": "u", "cost_ch_password": "p",
     "vendor_type": "Data and Tools", "vendor_cost_head": "Hyperverge",
+    "exotel_type": "Data and Tools", "exotel_cost_head": "Exotel",
 }
 DAY = dt.date(2026, 9, 18)
 
@@ -31,6 +32,14 @@ def test_resolve_maps_rows_to_cloud_keys():
     assert budgets.resolve(rows, CFG) == {
         "AWS": 1000000.0, "GCP": 3000000.0, "GMP": 1500000.0, "VENDOR": 300000.0,
     }
+
+
+def test_resolve_handles_both_named_vendors_independently():
+    rows = [
+        _row("Data and Tools", "Hyperverge", "", 300000),
+        _row("Data and Tools", "Exotel", "", 50000),
+    ]
+    assert budgets.resolve(rows, CFG) == {"VENDOR": 300000.0, "EXOTEL": 50000.0}
 
 
 def test_account_rows_sum_when_there_is_no_cost_head_row():

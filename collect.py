@@ -166,35 +166,30 @@ def _gcp_sections(cfg, target, source, cloud, label_prefix):
     return out
 
 
-def _vendor_section(cfg, target):
-    """The third-party vendor as a report section: one account, one row per
-    billing unit across the 7-day window.
+def _vendor_window_section(cfg, target, priced_day_fn, label, cloud, log_name):
+    """Shared shape for a single-day-API vendor's report section: one account,
+    one row per service across the 7-day window.
 
     The vendor API is single-day, so the window is assembled with one call per day
     (target-7 .. target — the WoW baseline needs day-7). Each day is fetched and
-    priced independently (store.vendor_priced_day) — an unavailable day (the
-    vendor's log export has real gaps) is skipped and logged, not treated as a
-    reason to drop the whole section: the other 7 days are still worth showing.
-    Only a missing TARGET day (nothing to report for the day this report is
-    actually about) empties the section.
+    priced independently (`priced_day_fn`, e.g. store.vendor_priced_day) — an
+    unavailable day (these vendors' exports have real gaps) is skipped and
+    logged, not treated as a reason to drop the whole section: the other 7 days
+    are still worth showing. Only a missing TARGET day (nothing to report for
+    the day this report is actually about) empties the section.
     """
-    import store
-    import vendor_billing
-    if not vendor_billing.configured(cfg):
-        return []
-    label = cfg.get("vendor_account_label") or "Vendor"
     window = [target - timedelta(days=i) for i in range(WINDOW_DAYS)] + [target - timedelta(days=7)]
     per_day = {}
     unavailable = []
     for d in sorted(set(window)):
-        hits = store.vendor_priced_day(cfg, d)
+        hits = priced_day_fn(cfg, d)
         if hits is None:
             unavailable.append(d)
             continue
         per_day[d] = {r["service"]: r["cost"] for r in hits}
     if unavailable:
-        log.warning("Vendor log unavailable for %d day(s) in the report window: %s",
-                    len(unavailable), ", ".join(d.isoformat() for d in unavailable))
+        log.warning("%s log unavailable for %d day(s) in the report window: %s",
+                    log_name, len(unavailable), ", ".join(d.isoformat() for d in unavailable))
     if not per_day.get(target):
         return []
 
@@ -203,9 +198,31 @@ def _vendor_section(cfg, target):
                    for d in sorted(per_day)]
     df = pd.DataFrame(rows_by_day, index=sorted(per_day))
     df["Total"] = df.sum(axis=1)
-    # The vendor bill carries no credits, so both bases are the same frame.
-    return [_build_section(cfg, label, "VENDOR", cfg["report_currency"],
+    # Neither vendor's bill carries credits, so both bases are the same frame.
+    return [_build_section(cfg, label, cloud, cfg["report_currency"],
                            {"usage": df, "invoiced": df}, target)]
+
+
+def _vendor_section(cfg, target):
+    import store
+    import vendor_billing
+    if not vendor_billing.configured(cfg):
+        return []
+    label = cfg.get("vendor_account_label") or "Vendor"
+    return _vendor_window_section(cfg, target, store.vendor_priced_day, label, "VENDOR", "Vendor")
+
+
+def _exotel_section(cfg, target):
+    import store
+    import exotel_billing
+    if not exotel_billing.configured(cfg):
+        return []
+    label = cfg.get("exotel_account_label") or "Exotel"
+
+    def priced_day(cfg, d):
+        return store.exotel_priced_day(cfg, d) if d == target else store.exotel_stored_day(cfg, d)
+
+    return _vendor_window_section(cfg, target, priced_day, label, "EXOTEL", "Exotel")
 
 
 def collect(cfg: dict, target: date | None = None) -> dict:
@@ -227,6 +244,7 @@ def collect(cfg: dict, target: date | None = None) -> dict:
         sections += _gcp_sections(cfg, target, "gcp", "GCP", "GCP ")
         sections += _gcp_sections(cfg, target, "gmp", "GMP", "GMP ")
         sections += _vendor_section(cfg, target)
+        sections += _exotel_section(cfg, target)
 
     if not sections:
         raise RuntimeError(f"No cost data available for {target} from any provider")
@@ -276,7 +294,10 @@ def monthly_projection(cfg: dict, report: dict) -> list[dict]:
     days = int(cfg.get("projection_days") or 30)
     t = report["totals"]
 
-    vendor_label = cfg.get("vendor_cost_head") or "Vendor"
+    bucket_labels = {
+        "VENDOR": cfg.get("vendor_cost_head") or "Vendor",
+        "EXOTEL": cfg.get("exotel_cost_head") or "Exotel",
+    }
 
     rows = []
     for cloud, daily in sorted(t["by_cloud"].items(), key=lambda kv: kv[1], reverse=True):
@@ -284,7 +305,7 @@ def monthly_projection(cfg: dict, report: dict) -> list[dict]:
         invoiced_daily = t["by_cloud_invoiced"].get(cloud, 0.0)
         budget = budgets.get(cloud)
         rows.append({
-            "label": vendor_label if cloud == "VENDOR" else cloud_name(cloud),
+            "label": bucket_labels.get(cloud, cloud_name(cloud)),
             "daily": daily,
             "projected": projected,
             "projected_invoiced": invoiced_daily * days,
@@ -334,10 +355,10 @@ def unit_economics(cfg: dict, report: dict) -> list[dict]:
     incl = f"incl {', '.join(others)}" if others else None
     both = bool(incl) and total_rides != rides_only
 
-    cloud = sum(v for c, v in t["by_cloud"].items() if c not in ("GMP", "VENDOR"))
+    cloud = sum(v for c, v in t["by_cloud"].items() if c not in ("GMP", "VENDOR", "EXOTEL"))
     maps = t["by_cloud"].get("GMP", 0.0)
     cloud_invoiced = sum(v for c, v in t["by_cloud_invoiced"].items()
-                         if c not in ("GMP", "VENDOR"))
+                         if c not in ("GMP", "VENDOR", "EXOTEL"))
     maps_invoiced = t["by_cloud_invoiced"].get("GMP", 0.0)
 
     rows = []
